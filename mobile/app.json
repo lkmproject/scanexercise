@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "試卷筆跡清除",
+    "slug": "scanexercise",
+    "scheme": "scanexercise",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.scanexercise.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "用來拍攝試卷。",
+        "NSPhotoLibraryUsageDescription": "用來選取試卷圖片。",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.scanexercise.app",
+      "usesCleartextTraffic": true
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "用來選取試卷圖片。"
+        }
+      ]
+    ]
+  }
+}

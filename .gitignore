@@ -1,0 +1,9 @@
+.DS_Store
+backend/.venv
+backend/.env
+backend/data
+mobile/node_modules
+mobile/.expo
+mobile/ios
+mobile/android
+mobile/dist
