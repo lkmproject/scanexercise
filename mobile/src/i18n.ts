@@ -40,8 +40,13 @@ type Copy = {
   shareBlank: string;
   erased: (n: number) => string;
   erasedHint: string;
+  pendingLeft: (n: number) => string;
   addMore: string;
   again: string;
+  againConfirm: string;
+  againConfirmCopy: string;
+  cancel: string;
+  confirm: string;
   home: string;
   me: string;
   back: string;
@@ -98,8 +103,13 @@ export const copy: Record<Locale, Copy> = {
     shareBlank: '分享空白卷',
     erased: (n) => `已清除 ${n} 頁`,
     erasedHint: '點圖可對比修改前後',
+    pendingLeft: (n) => `還有 ${n} 頁未清`,
     addMore: '再加頁面',
     again: '重來',
+    againConfirm: '要重來嗎？',
+    againConfirmCopy: '已匯入和清除的頁面都會刪掉。',
+    cancel: '取消',
+    confirm: '確認',
     home: '首頁',
     me: '我的',
     back: '返回',
@@ -154,8 +164,13 @@ export const copy: Record<Locale, Copy> = {
     shareBlank: '分享空白卷',
     erased: (n) => `已清除 ${n} 页`,
     erasedHint: '点图可对比修改前后',
+    pendingLeft: (n) => `还有 ${n} 页未清`,
     addMore: '再加页面',
     again: '重来',
+    againConfirm: '要重来吗？',
+    againConfirmCopy: '已导入和清除的页面都会删掉。',
+    cancel: '取消',
+    confirm: '确认',
     home: '首页',
     me: '我的',
     back: '返回',
@@ -210,8 +225,13 @@ export const copy: Record<Locale, Copy> = {
     shareBlank: 'Share the blank paper',
     erased: (n) => (n === 1 ? '1 page erased' : `${n} pages erased`),
     erasedHint: 'Tap a page to compare before and after',
+    pendingLeft: (n) => (n === 1 ? '1 new page left' : `${n} new pages left`),
     addMore: 'Add pages',
     again: 'Start over',
+    againConfirm: 'Start over?',
+    againConfirmCopy: 'Imported and erased pages will be removed.',
+    cancel: 'Cancel',
+    confirm: 'Confirm',
     home: 'Home',
     me: 'Me',
     back: 'Back',

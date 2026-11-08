@@ -42,6 +42,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('home');
   const [crop, setCrop] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
   const [locale, setLocale] = useState<Locale>(localeFromDevice);
   const t = copy[locale];
   const tRef = useRef(t);
@@ -231,6 +232,19 @@ export default function App() {
     setTab('home');
   }
 
+  function confirmReset() {
+    setResetOpen(true);
+  }
+
+  function closeReset() {
+    setResetOpen(false);
+  }
+
+  function applyReset() {
+    setResetOpen(false);
+    reset();
+  }
+
   function removeSheet(index: number) {
     const next = sheets.filter((_, item) => item !== index);
     setSheets(next);
@@ -244,10 +258,9 @@ export default function App() {
   const processedCount = sheets.filter((sheet) => sheet.processed != null).length;
   const pendingCount = sheets.length - processedCount;
   const shownPages = sheets.map((sheet) => sheet.processed ?? sheet.original);
-  const allCleared = processedCount > 0 && pendingCount === 0 && phase !== 'processing';
   const showBanner = tab === 'home' && phase !== 'processing' && processedCount === 0;
-  const showResult = tab === 'home' && allCleared;
-  const showTiles = tab === 'home' && phase !== 'processing' && !allCleared;
+  const showResult = tab === 'home' && processedCount > 0 && phase !== 'processing';
+  const showTiles = tab === 'home' && phase !== 'processing' && processedCount === 0;
 
   function addFromAlbum() {
     if (Platform.OS === 'ios') {
@@ -343,23 +356,66 @@ export default function App() {
           <View style={styles.tilesSticky}>
             <View style={styles.resultCard}>
               <Text style={styles.resultTitle}>{t.erased(processedCount)}</Text>
-              <Text style={styles.resultHint}>{t.erasedHint}</Text>
-              <Pressable
-                style={styles.resultPdf}
-                disabled={sharing}
-                onPress={() => void sharePdf()}
-              >
-                <Text style={styles.resultPdfLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
-              </Pressable>
+              <Text style={styles.resultHint}>
+                {pendingCount > 0 ? t.pendingLeft(pendingCount) : t.erasedHint}
+              </Text>
+              {pendingCount > 0 ? (
+                <>
+                  <Pressable style={styles.resultPrimary} disabled={busy} onPress={() => void submit()}>
+                    <Text style={styles.resultPrimaryLabel}>{t.eraseNew}</Text>
+                  </Pressable>
+                  <View style={styles.resultCropRow}>
+                    <Text style={styles.resultCropLabel}>{t.crop}</Text>
+                    <Pressable
+                      disabled={busy}
+                      onPress={() => setCrop((current) => !current)}
+                      hitSlop={8}
+                      accessibilityRole="switch"
+                      accessibilityState={{ checked: crop }}
+                      accessibilityLabel={t.crop}
+                    >
+                      <View style={[styles.switchTrack, crop ? styles.switchOn : null]}>
+                        <View style={[styles.switchThumb, crop ? styles.switchThumbOn : null]} />
+                      </View>
+                    </Pressable>
+                  </View>
+                </>
+              ) : (
+                <Pressable
+                  style={styles.resultPrimary}
+                  disabled={sharing}
+                  onPress={() => void sharePdf()}
+                >
+                  <Text style={styles.resultPrimaryLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
+                </Pressable>
+              )}
             </View>
             <View style={styles.resultRow}>
               <Pressable style={styles.resultSecondary} onPress={addFromAlbum}>
+                <AddPagesIcon />
                 <Text style={styles.resultSecondaryLabel}>{t.addMore}</Text>
               </Pressable>
-              <Pressable style={styles.resultSecondary} onPress={reset}>
-                <Text style={styles.resultSecondaryLabel}>{t.again}</Text>
-              </Pressable>
+              {pendingCount > 0 ? (
+                <Pressable
+                  style={styles.resultSecondary}
+                  disabled={sharing}
+                  onPress={() => void sharePdf()}
+                >
+                  <Text style={styles.resultSecondaryLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
+                </Pressable>
+              ) : (
+                <Pressable style={styles.resultSecondary} onPress={confirmReset}>
+                  <AgainIcon />
+                  <Text style={styles.resultSecondaryLabel}>{t.again}</Text>
+                </Pressable>
+              )}
             </View>
+            {pendingCount > 0 ? (
+              <Pressable style={styles.resultAgain} onPress={confirmReset}>
+                <AgainIcon color="#6E6E6E" />
+                <Text style={styles.resultAgainLabel}>{t.again}</Text>
+              </Pressable>
+            ) : null}
           </View>
         ) : null}
 
@@ -466,16 +522,6 @@ export default function App() {
                 </View>
               ) : null}
 
-              {phase === 'done' && !allCleared ? (
-                <View style={styles.doneActions}>
-                  <Pressable style={styles.resultPdf} disabled={sharing} onPress={() => void sharePdf()}>
-                    <Text style={styles.resultPdfLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
-                  </Pressable>
-                  <Pressable style={styles.resetBtn} onPress={reset}>
-                    <Text style={styles.resetLabel}>{t.again}</Text>
-                  </Pressable>
-                </View>
-              ) : null}
             </>
           )}
 
@@ -514,6 +560,30 @@ export default function App() {
           </View>
         </Pressable>
       </View>
+
+      <Modal
+        visible={resetOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={closeReset}
+      >
+        <View style={styles.confirmScrim}>
+          <Pressable style={styles.confirmDismiss} onPress={closeReset} />
+          <View style={styles.confirmCard}>
+            <Text style={styles.confirmTitle}>{t.againConfirm}</Text>
+            <Text style={styles.confirmCopy}>{t.againConfirmCopy}</Text>
+            <View style={styles.confirmRow}>
+              <Pressable style={styles.confirmCancel} onPress={closeReset}>
+                <Text style={styles.confirmCancelLabel}>{t.cancel}</Text>
+              </Pressable>
+              <Pressable style={styles.confirmOk} onPress={applyReset}>
+                <Text style={styles.confirmOkLabel}>{t.confirm}</Text>
+              </Pressable>
+            </View>
+          </View>
+          <Pressable style={styles.confirmDismiss} onPress={closeReset} />
+        </View>
+      </Modal>
 
       <Modal
         visible={aboutOpen}
@@ -568,6 +638,24 @@ async function loadPreviews(job: Job): Promise<string[]> {
 function isCancel(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /cancel/i.test(message);
+}
+
+function AddPagesIcon() {
+  return (
+    <View style={styles.addIcon}>
+      <View style={styles.addIconH} />
+      <View style={styles.addIconV} />
+    </View>
+  );
+}
+
+function AgainIcon({ color = '#111111' }: { color?: string }) {
+  return (
+    <View style={styles.againIcon}>
+      <View style={[styles.againArc, { borderColor: color, borderTopColor: 'transparent' }]} />
+      <View style={[styles.againHead, { borderBottomColor: color }]} />
+    </View>
+  );
 }
 
 const VIEWABILITY = { itemVisiblePercentThreshold: 60 };
@@ -1237,25 +1325,38 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 28,
     fontWeight: '800',
+    textAlign: 'center',
   },
   resultHint: {
     marginTop: 8,
     color: '#FFD600',
     fontSize: 15,
     fontWeight: '700',
+    textAlign: 'center',
   },
-  resultPdf: {
+  resultPrimary: {
     marginTop: 16,
-    alignSelf: 'flex-start',
     backgroundColor: '#FFD600',
-    borderRadius: 16,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    borderRadius: 22,
+    paddingVertical: 14,
+    alignItems: 'center',
   },
-  resultPdfLabel: {
+  resultPrimaryLabel: {
     color: '#111111',
     fontWeight: '800',
-    fontSize: 16,
+    fontSize: 18,
+  },
+  resultCropRow: {
+    marginTop: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  resultCropLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
   resultRow: {
     marginTop: 12,
@@ -1267,26 +1368,77 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 22,
     paddingVertical: 16,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
   },
   resultSecondaryLabel: {
     color: '#111111',
     fontSize: 16,
     fontWeight: '700',
   },
-  doneActions: {
-    marginTop: 16,
-    gap: 12,
-  },
-  resetBtn: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 22,
-    paddingVertical: 16,
+  addIcon: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 1.8,
+    borderColor: '#111111',
     alignItems: 'center',
+    justifyContent: 'center',
   },
-  resetLabel: {
-    color: '#111111',
-    fontSize: 16,
+  addIconH: {
+    position: 'absolute',
+    width: 8,
+    height: 1.8,
+    borderRadius: 1,
+    backgroundColor: '#111111',
+  },
+  addIconV: {
+    position: 'absolute',
+    width: 1.8,
+    height: 8,
+    borderRadius: 1,
+    backgroundColor: '#111111',
+  },
+  againIcon: {
+    width: 16,
+    height: 16,
+  },
+  againArc: {
+    position: 'absolute',
+    top: 1,
+    left: 1,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 1.8,
+    borderTopColor: 'transparent',
+  },
+  againHead: {
+    position: 'absolute',
+    top: 0,
+    right: 1,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 3.5,
+    borderRightWidth: 3.5,
+    borderBottomWidth: 5,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    transform: [{ rotate: '45deg' }],
+  },
+  resultAgain: {
+    marginTop: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+  },
+  resultAgainLabel: {
+    color: '#6E6E6E',
+    fontSize: 15,
     fontWeight: '700',
   },
   meCard: {
@@ -1315,6 +1467,65 @@ const styles = StyleSheet.create({
   },
   homeChipLabel: {
     color: '#111111',
+    fontWeight: '800',
+  },
+  confirmScrim: {
+    flex: 1,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(17, 17, 17, 0.45)',
+    paddingHorizontal: 28,
+  },
+  confirmDismiss: {
+    flex: 1,
+  },
+  confirmCard: {
+    backgroundColor: '#111111',
+    borderRadius: 28,
+    paddingHorizontal: 22,
+    paddingTop: 24,
+    paddingBottom: 20,
+  },
+  confirmTitle: {
+    color: '#FFFFFF',
+    fontSize: 26,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  confirmCopy: {
+    marginTop: 10,
+    color: '#FFD600',
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  confirmRow: {
+    marginTop: 20,
+    flexDirection: 'row',
+    gap: 12,
+  },
+  confirmCancel: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  confirmCancelLabel: {
+    color: '#111111',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  confirmOk: {
+    flex: 1,
+    backgroundColor: '#FFD600',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  confirmOkLabel: {
+    color: '#111111',
+    fontSize: 16,
     fontWeight: '800',
   },
   aboutScrim: {
