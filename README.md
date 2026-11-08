@@ -1,27 +1,26 @@
 # scanexercise
 
-移除試卷上的手寫、塗鴉與箭頭，並保留印刷內容。擦除使用伺服器上的固定 prompt 呼叫千問圖像編輯（中國香港地域的 `qwen-image-3.0-pro`）。
+移除試卷上的手寫、塗鴉與箭頭，並保留印刷內容。擦除使用 TextIn「自动擦除手写文字」。
 
 ## 後端
 
 ```bash
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env
 ```
 
-在阿里雲百煉的中國香港工作空間建立 API key，把 `DASHSCOPE_API_KEY` 和 `QWEN_WORKSPACE_ID` 填入 `.env`。金鑰、工作空間和模型必須同屬香港地域。然後：
+到 [TextIn 工作台](https://www.textin.com/) → 帳號設定 → 開發者資訊，把 `TEXTIN_APP_ID`（x-ti-app-id）與 `TEXTIN_SECRET_CODE`（x-ti-secret-code）填入 `.env`，並開通「自动擦除手写文字」。然後：
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+go run ./cmd/server
 ```
+
+預設聽 `0.0.0.0:8000`。可用 `PORT` 改埠。
 
 測試：
 
 ```bash
-cd backend && .venv/bin/pytest
+cd backend && go test ./...
 ```
 
 ## App

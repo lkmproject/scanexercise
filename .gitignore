@@ -1,5 +1,8 @@
 .DS_Store
+__pycache__/
+*.pyc
 backend/.venv
+backend/.pytest_cache
 backend/.env
 backend/data
 mobile/node_modules
