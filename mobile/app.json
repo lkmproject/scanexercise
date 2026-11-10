@@ -15,7 +15,17 @@
         "NSPhotoLibraryUsageDescription": "用來選取試卷圖片。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
-        }
+        },
+        "GIDClientID": "430840613406-tnq189it2aso4uvbhb5vec8tss43js3i.apps.googleusercontent.com",
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLSchemes": [
+              "scanexercise",
+              "com.scanexercise.app",
+              "com.googleusercontent.apps.430840613406-tnq189it2aso4uvbhb5vec8tss43js3i"
+            ]
+          }
+        ]
       }
     },
     "android": {
@@ -27,6 +37,12 @@
         "expo-image-picker",
         {
           "photosPermission": "用來選取試卷圖片。"
+        }
+      ],
+      [
+        "@react-native-google-signin/google-signin",
+        {
+          "iosUrlScheme": "com.googleusercontent.apps.430840613406-tnq189it2aso4uvbhb5vec8tss43js3i"
         }
       ]
     ]

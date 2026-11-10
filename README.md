@@ -1,6 +1,6 @@
 # scanexercise
 
-移除試卷上的手寫、塗鴉與箭頭，並保留印刷內容。擦除使用 TextIn「自动擦除手写文字」。
+移除試卷上的手寫、塗鴉與箭頭，並保留印刷內容。擦除使用 TextIn「自动擦除手写文字」。後端使用 Go 與 [Gin](https://github.com/gin-gonic/gin)。
 
 ## 後端
 
@@ -9,7 +9,7 @@ cd backend
 cp .env.example .env
 ```
 
-到 [TextIn 工作台](https://www.textin.com/) → 帳號設定 → 開發者資訊，把 `TEXTIN_APP_ID`（x-ti-app-id）與 `TEXTIN_SECRET_CODE`（x-ti-secret-code）填入 `.env`，並開通「自动擦除手写文字」。然後：
+到 [TextIn 工作台](https://www.textin.com/) → 帳號設定 → 開發者資訊，把 `TEXTIN_APP_ID`（x-ti-app-id）與 `TEXTIN_SECRET_CODE`（x-ti-secret-code）填入 `.env`，並開通「自动擦除手写文字」。Google 登入另需 `GOOGLE_WEB_CLIENT_ID`、`JWT_SECRET`、`AWS_REGION=ap-southeast-1`，以及可寫入 DynamoDB `Users` 的 AWS 憑證。然後：
 
 ```bash
 go run ./cmd/server

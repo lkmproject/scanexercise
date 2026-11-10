@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -13,11 +14,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/disintegration/imaging"
-
+	"scanexercise/internal/apicode"
+	"scanexercise/internal/auth"
 	"scanexercise/internal/config"
 	"scanexercise/internal/editor"
 	"scanexercise/internal/jobs"
@@ -38,7 +40,7 @@ func (f *fakeEditor) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error)
 		return nil, f.err
 	}
 	if len(f.results) == 0 {
-		return nil, editor.Fail("模型沒有回傳圖像")
+		return nil, editor.Fail("model returned no image")
 	}
 	out := f.results[0]
 	f.results = f.results[1:]
@@ -54,7 +56,7 @@ func (f *failSecond) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error)
 	if f.calls == 1 {
 		return jpegColor(color.RGBA{G: 255, A: 255}, 20, 10), nil
 	}
-	return nil, editor.Fail("模型逾時")
+	return nil, editor.Fail("model timed out")
 }
 
 func jpegColor(c color.Color, width, height int) []byte {
@@ -98,7 +100,54 @@ func buildExifAPP1(orientation uint16) []byte {
 	return append(app1, payload...)
 }
 
+type bearerTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (b *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return b.base.RoundTrip(clone)
+}
+
+type memoryWallet struct {
+	mu        sync.Mutex
+	remaining int
+}
+
+func (m *memoryWallet) Reserve(_ context.Context, _ string, pages int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.remaining < pages {
+		return auth.ErrInsufficient
+	}
+	m.remaining -= pages
+	return nil
+}
+
+func (m *memoryWallet) Refund(_ context.Context, _ string, pages int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.remaining += pages
+	return nil
+}
+
+func (m *memoryWallet) Balance(_ context.Context, _ string) (int, error) {
+	return m.remainingNow(), nil
+}
+
+func (m *memoryWallet) remainingNow() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.remaining
+}
+
 func newClient(t *testing.T, ed editor.Editor) (*httptest.Server, *http.Client) {
+	return newClientWithWallet(t, ed, nil)
+}
+
+func newClientWithWallet(t *testing.T, ed editor.Editor, wallet jobs.Wallet) (*httptest.Server, *http.Client) {
 	t.Helper()
 	settings := config.Settings{
 		DataDir:              t.TempDir(),
@@ -109,9 +158,17 @@ func newClient(t *testing.T, ed editor.Editor) (*httptest.Server, *http.Client) 
 		MaxUploadBytes:       20 * 1024 * 1024,
 	}
 	store := jobs.NewStore(settings, ed)
-	ts := httptest.NewServer(appserver.New(store))
+	store.SetWallet(wallet)
+	tokens := auth.NewTokens("test-secret")
+	token, err := tokens.Issue("test-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(appserver.New(store, nil, tokens))
 	t.Cleanup(ts.Close)
-	return ts, ts.Client()
+	client := ts.Client()
+	client.Transport = &bearerTransport{base: client.Transport, token: token}
+	return ts, client
 }
 
 func postPages(t *testing.T, client *http.Client, base string, files [][]byte) *http.Response {
@@ -152,7 +209,7 @@ func postPagesCrop(t *testing.T, client *http.Client, base string, files [][]byt
 	return resp
 }
 
-func decodeJSON(t *testing.T, resp *http.Response) map[string]any {
+func decodeEnvelope(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
 	defer resp.Body.Close()
 	var payload map[string]any
@@ -160,6 +217,46 @@ func decodeJSON(t *testing.T, resp *http.Response) map[string]any {
 		t.Fatal(err)
 	}
 	return payload
+}
+
+func decodeData(t *testing.T, resp *http.Response) map[string]any {
+	t.Helper()
+	payload := decodeEnvelope(t, resp)
+	if codeOf(payload) != int32(apicode.OK) {
+		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
+	}
+	if payload["reason"] != "success" {
+		t.Fatalf("reason %#v", payload["reason"])
+	}
+	data, _ := payload["data"].(map[string]any)
+	if data == nil {
+		t.Fatal("missing data")
+	}
+	return data
+}
+
+func codeOf(payload map[string]any) int32 {
+	switch value := payload["code"].(type) {
+	case float64:
+		return int32(value)
+	case int32:
+		return value
+	case int:
+		return int32(value)
+	default:
+		return 0
+	}
+}
+
+func remainingOf(data map[string]any) int {
+	switch value := data["remaining"].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	default:
+		return -1
+	}
 }
 
 func wait(t *testing.T, client *http.Client, base, jobID string) map[string]any {
@@ -170,7 +267,7 @@ func wait(t *testing.T, client *http.Client, base, jobID string) map[string]any 
 		if err != nil {
 			t.Fatal(err)
 		}
-		last = decodeJSON(t, resp)
+		last = decodeData(t, resp)
 		status, _ := last["status"].(string)
 		if status == "succeeded" || status == "failed" {
 			return last
@@ -186,14 +283,14 @@ func TestPreprocessAppliesExifAndLimitsLongEdge(t *testing.T) {
 	ts, client := newClient(t, ed)
 	raw := jpegWithOrientation(300, 40, 6)
 	resp := postPages(t, client, ts.URL, [][]byte{raw})
-	if resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	jobID := decodeJSON(t, resp)["id"].(string)
+	jobID := decodeData(t, resp)["id"].(string)
 	if wait(t, client, ts.URL, jobID)["status"] != "succeeded" {
 		t.Fatal("expected success")
 	}
-	prepared, err := imaging.Decode(bytes.NewReader(ed.calls[0]))
+	prepared, err := jpeg.Decode(bytes.NewReader(ed.calls[0]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +314,7 @@ func TestSuccessReturnsEditedPagesInOrderThenDeletesAfterPDF(t *testing.T) {
 	ed := &fakeEditor{results: append([][]byte{}, edited...)}
 	ts, client := newClient(t, ed)
 	resp := postPages(t, client, ts.URL, [][]byte{first, second})
-	jobID := decodeJSON(t, resp)["id"].(string)
+	jobID := decodeData(t, resp)["id"].(string)
 	body := wait(t, client, ts.URL, jobID)
 	if body["status"] != "succeeded" {
 		t.Fatalf("status %v", body["status"])
@@ -261,12 +358,12 @@ func TestSuccessReturnsEditedPagesInOrderThenDeletesAfterPDF(t *testing.T) {
 
 func TestModelFailureDoesNotReturnTheOriginal(t *testing.T) {
 	original := jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)
-	ed := &fakeEditor{err: editor.Fail("模型沒有回傳圖像")}
+	ed := &fakeEditor{err: editor.Fail("model returned no image")}
 	ts, client := newClient(t, ed)
 	resp := postPages(t, client, ts.URL, [][]byte{original})
-	jobID := decodeJSON(t, resp)["id"].(string)
+	jobID := decodeData(t, resp)["id"].(string)
 	body := wait(t, client, ts.URL, jobID)
-	if body["status"] != "failed" || body["error"] != "模型沒有回傳圖像" {
+	if body["status"] != "failed" || body["error"] != "model returned no image" {
 		t.Fatalf("body %#v", body)
 	}
 	preview, err := client.Get(ts.URL + "/jobs/" + jobID + "/preview/0")
@@ -297,9 +394,9 @@ func TestSecondPageFailureDiscardsPartialOutput(t *testing.T) {
 		jpegColor(color.RGBA{R: 255, A: 255}, 20, 10),
 		jpegColor(color.RGBA{B: 255, A: 255}, 20, 10),
 	})
-	jobID := decodeJSON(t, resp)["id"].(string)
+	jobID := decodeData(t, resp)["id"].(string)
 	body := wait(t, client, ts.URL, jobID)
-	if body["status"] != "failed" || body["error"] != "模型逾時" {
+	if body["status"] != "failed" || body["error"] != "model timed out" {
 		t.Fatalf("body %#v", body)
 	}
 	preview, err := client.Get(ts.URL + "/jobs/" + jobID + "/preview/0")
@@ -325,12 +422,15 @@ func TestRejectsTooManyPagesAndUnreadableImages(t *testing.T) {
 	resp.Body.Close()
 
 	invalid := postPages(t, client, ts.URL, [][]byte{[]byte("not-an-image")})
-	payload := decodeJSON(t, invalid)
+	payload := decodeEnvelope(t, invalid)
 	if invalid.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid status %d", invalid.StatusCode)
 	}
-	if payload["detail"] != "無法讀取圖片" {
-		t.Fatalf("detail %#v", payload["detail"])
+	if codeOf(payload) != int32(apicode.InvalidImage) {
+		t.Fatalf("code %#v", payload["code"])
+	}
+	if payload["reason"] != "cannot read image" {
+		t.Fatalf("reason %#v", payload["reason"])
 	}
 }
 
@@ -345,11 +445,18 @@ func TestExpiredJobIsRemoved(t *testing.T) {
 	}
 	ed := &fakeEditor{results: [][]byte{jpegColor(color.RGBA{G: 255, A: 255}, 16, 16)}}
 	store := jobs.NewStore(settings, ed)
-	ts := httptest.NewServer(appserver.New(store))
+	tokens := auth.NewTokens("test-secret")
+	token, err := tokens.Issue("test-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(appserver.New(store, nil, tokens))
 	t.Cleanup(ts.Close)
-	resp := postPages(t, ts.Client(), ts.URL, [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)})
-	jobID := decodeJSON(t, resp)["id"].(string)
-	if wait(t, ts.Client(), ts.URL, jobID)["status"] != "succeeded" {
+	client := ts.Client()
+	client.Transport = &bearerTransport{base: client.Transport, token: token}
+	resp := postPages(t, client, ts.URL, [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)})
+	jobID := decodeData(t, resp)["id"].(string)
+	if wait(t, client, ts.URL, jobID)["status"] != "succeeded" {
 		t.Fatal("expected success")
 	}
 	metaPath := filepath.Join(settings.DataDir, "jobs", jobID, "meta.json")
@@ -366,7 +473,7 @@ func TestExpiredJobIsRemoved(t *testing.T) {
 	if err := os.WriteFile(metaPath, updated, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gone, err := ts.Client().Get(ts.URL + "/jobs/" + jobID)
+	gone, err := client.Get(ts.URL + "/jobs/" + jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +507,7 @@ func TestCropFlagIsPassedToEditor(t *testing.T) {
 	ed := &fakeEditor{results: [][]byte{jpegColor(color.RGBA{G: 255, A: 255}, 16, 16)}}
 	ts, client := newClient(t, ed)
 	resp := postPagesCrop(t, client, ts.URL, [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)}, "1")
-	jobID := decodeJSON(t, resp)["id"].(string)
+	jobID := decodeData(t, resp)["id"].(string)
 	body := wait(t, client, ts.URL, jobID)
 	if body["status"] != "succeeded" {
 		t.Fatalf("status %v", body["status"])
@@ -449,5 +556,112 @@ func TestPDFFromUploads(t *testing.T) {
 	}
 	if !bytes.HasPrefix(data, []byte("%PDF")) {
 		t.Fatalf("not a pdf")
+	}
+}
+
+func TestCreateJobUnauthorized(t *testing.T) {
+	settings := config.Settings{
+		DataDir:              t.TempDir(),
+		MaxPages:             20,
+		RetentionHours:       24,
+		MaxLongEdge:          100,
+		TextInTimeoutSeconds: 5,
+		MaxUploadBytes:       20 * 1024 * 1024,
+	}
+	store := jobs.NewStore(settings, &fakeEditor{results: [][]byte{jpegColor(color.RGBA{G: 255, A: 255}, 8, 8)}})
+	ts := httptest.NewServer(appserver.New(store, nil, auth.NewTokens("test-secret")))
+	t.Cleanup(ts.Close)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("pages", "page.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(jpegColor(color.RGBA{G: 255, A: 255}, 8, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/jobs", &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer expired-token")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	payload := decodeEnvelope(t, resp)
+	if codeOf(payload) != int32(apicode.Unauthorized) {
+		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
+	}
+}
+
+func TestCreateJobRejectsInsufficientCredits(t *testing.T) {
+	wallet := &memoryWallet{remaining: 1}
+	ed := &fakeEditor{results: [][]byte{
+		jpegColor(color.RGBA{G: 255, A: 255}, 16, 16),
+		jpegColor(color.RGBA{B: 255, A: 255}, 16, 16),
+	}}
+	ts, client := newClientWithWallet(t, ed, wallet)
+	page := jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)
+	resp := postPages(t, client, ts.URL, [][]byte{page, page})
+	payload := decodeEnvelope(t, resp)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d body %#v", resp.StatusCode, payload)
+	}
+	if codeOf(payload) != int32(apicode.InsufficientCredits) {
+		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
+	}
+	if wallet.remainingNow() != 1 {
+		t.Fatalf("remaining %d", wallet.remainingNow())
+	}
+}
+
+func TestCreateJobRefundsOnFailure(t *testing.T) {
+	wallet := &memoryWallet{remaining: 2}
+	ts, client := newClientWithWallet(t, &fakeEditor{err: editor.Fail("model timed out")}, wallet)
+	resp := postPages(t, client, ts.URL, [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)})
+	created := decodeData(t, resp)
+	if remainingOf(created) != 1 {
+		t.Fatalf("create remaining %d", remainingOf(created))
+	}
+	jobID := created["id"].(string)
+	done := wait(t, client, ts.URL, jobID)
+	if done["status"] != "failed" {
+		t.Fatal("expected failed")
+	}
+	if remainingOf(done) != 2 {
+		t.Fatalf("failed remaining %d", remainingOf(done))
+	}
+	if wallet.remainingNow() != 2 {
+		t.Fatalf("remaining %d", wallet.remainingNow())
+	}
+}
+
+func TestCreateJobChargesOnSuccess(t *testing.T) {
+	wallet := &memoryWallet{remaining: 2}
+	ed := &fakeEditor{results: [][]byte{jpegColor(color.RGBA{G: 255, A: 255}, 16, 16)}}
+	ts, client := newClientWithWallet(t, ed, wallet)
+	resp := postPages(t, client, ts.URL, [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)})
+	created := decodeData(t, resp)
+	if remainingOf(created) != 1 {
+		t.Fatalf("create remaining %d", remainingOf(created))
+	}
+	jobID := created["id"].(string)
+	done := wait(t, client, ts.URL, jobID)
+	if done["status"] != "succeeded" {
+		t.Fatal("expected success")
+	}
+	if remainingOf(done) != 1 {
+		t.Fatalf("success remaining %d", remainingOf(done))
+	}
+	if wallet.remainingNow() != 1 {
+		t.Fatalf("remaining %d", wallet.remainingNow())
 	}
 }

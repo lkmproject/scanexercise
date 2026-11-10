@@ -65,6 +65,15 @@ type Copy = {
   saveFailed: string;
   pdfFailed: string;
   shareUnavailable: string;
+  appleLogin: string;
+  googleLogin: string;
+  close: string;
+  googleFailed: string;
+  signedInBadge: string;
+  remainingErase: string;
+  remainingTimes: string;
+  notEnoughErases: string;
+  logout: string;
 };
 
 export const copy: Record<Locale, Copy> = {
@@ -128,6 +137,15 @@ export const copy: Record<Locale, Copy> = {
     saveFailed: '無法儲存檔案',
     pdfFailed: '無法下載 PDF',
     shareUnavailable: '這台裝置無法分享檔案',
+    appleLogin: '透過 Apple 登入',
+    googleLogin: '透過 Google 登入',
+    close: '關閉',
+    googleFailed: '無法使用 Google 登入',
+    signedInBadge: '已登入',
+    remainingErase: '剩餘清除',
+    remainingTimes: '次',
+    notEnoughErases: '清除次數不足',
+    logout: '登出',
   },
   'zh-Hans': {
     subtitle: '拍完就能重做。',
@@ -189,6 +207,15 @@ export const copy: Record<Locale, Copy> = {
     saveFailed: '无法保存文件',
     pdfFailed: '无法下载 PDF',
     shareUnavailable: '这台设备无法分享文件',
+    appleLogin: '通过 Apple 登录',
+    googleLogin: '通过 Google 登录',
+    close: '关闭',
+    googleFailed: '无法使用 Google 登录',
+    signedInBadge: '已登录',
+    remainingErase: '剩余清除',
+    remainingTimes: '次',
+    notEnoughErases: '清除次数不足',
+    logout: '登出',
   },
   en: {
     subtitle: 'Snap it, then start over.',
@@ -250,6 +277,15 @@ export const copy: Record<Locale, Copy> = {
     saveFailed: "Couldn't save the file",
     pdfFailed: "Couldn't download the PDF",
     shareUnavailable: "This device can't share files",
+    appleLogin: 'Continue with Apple',
+    googleLogin: 'Continue with Google',
+    close: 'Close',
+    googleFailed: "Couldn't sign in with Google",
+    signedInBadge: 'Signed in',
+    remainingErase: 'Erases left',
+    remainingTimes: '',
+    notEnoughErases: 'Not enough erases',
+    logout: 'Log out',
   },
 };
 

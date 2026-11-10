@@ -7,14 +7,17 @@ import (
 )
 
 type Settings struct {
-	TextInAppID           string
-	TextInSecretCode      string
-	DataDir               string
-	MaxPages              int
-	RetentionHours        int
-	MaxLongEdge           int
-	TextInTimeoutSeconds  int
-	MaxUploadBytes        int
+	TextInAppID          string
+	TextInSecretCode     string
+	DataDir              string
+	MaxPages             int
+	RetentionHours       int
+	MaxLongEdge          int
+	TextInTimeoutSeconds int
+	MaxUploadBytes       int
+	GoogleWebClientID    string
+	AWSRegion            string
+	JWTSecret            string
 }
 
 func Load() Settings {
@@ -28,6 +31,12 @@ func Load() Settings {
 		MaxLongEdge:          getenvInt("MAX_LONG_EDGE", 2048),
 		TextInTimeoutSeconds: getenvInt("TEXTIN_TIMEOUT_SECONDS", 180),
 		MaxUploadBytes:       20 * 1024 * 1024,
+		GoogleWebClientID: getenv(
+			"GOOGLE_WEB_CLIENT_ID",
+			"430840613406-4eki8kbemjbhc0jbah93v1vdc33fuf6p.apps.googleusercontent.com",
+		),
+		AWSRegion: getenv("AWS_REGION", "ap-southeast-1"),
+		JWTSecret: getenv("JWT_SECRET", ""),
 	}
 }
 

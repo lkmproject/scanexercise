@@ -48,21 +48,21 @@ func NewTextIn(appID, secretCode string, timeoutSeconds int) *TextIn {
 
 func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	if t.AppID == "" || t.SecretCode == "" {
-		return nil, Fail("尚未設定 TEXTIN_APP_ID 或 TEXTIN_SECRET_CODE")
+		return nil, Fail("TEXTIN_APP_ID or TEXTIN_SECRET_CODE is not set")
 	}
 	crop := 0
 	if opts.Crop == 1 {
 		crop = 1
 	}
 	query := url.Values{}
-	query.Set("crop", strconv.Itoa(crop))                    // 0 关闭切边，1 执行切边
-	query.Set("dewarp", strconv.Itoa(t.Dewarp))              // 0 不执行弯曲矫正
-	query.Set("binarization", strconv.Itoa(t.Binarization))  // 0 不执行增强锐化滤镜
-	query.Set("image_type", strconv.Itoa(t.ImageType))       // 1 返回彩色图像
-	query.Set("doc_direction", strconv.Itoa(t.DocDirection)) // 0 关闭方向转正
+	query.Set("crop", strconv.Itoa(crop))                    // 0 skip crop, 1 crop
+	query.Set("dewarp", strconv.Itoa(t.Dewarp))              // 0 skip dewarp
+	query.Set("binarization", strconv.Itoa(t.Binarization))  // 0 skip binarization
+	query.Set("image_type", strconv.Itoa(t.ImageType))       // 1 return color image
+	query.Set("doc_direction", strconv.Itoa(t.DocDirection)) // 0 skip orientation
 	req, err := http.NewRequest(http.MethodPost, editURL+"?"+query.Encode(), bytes.NewReader(jpeg))
 	if err != nil {
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	req.Header.Set("x-ti-app-id", t.AppID)
 	req.Header.Set("x-ti-secret-code", t.SecretCode)
@@ -75,21 +75,21 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		if isTimeout(err) {
-			return nil, Fail("模型逾時")
+			return nil, Fail("model timed out")
 		}
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	raw, err := processedImage(payload)
 	if err != nil {
@@ -97,7 +97,7 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	}
 	encoded, err := preprocess.ToJPEG(raw)
 	if err != nil {
-		return nil, Fail("模型沒有回傳圖像")
+		return nil, Fail("model returned no image")
 	}
 	return encoded, nil
 }
@@ -105,22 +105,22 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 func processedImage(payload any) ([]byte, error) {
 	root, ok := payload.(map[string]any)
 	if !ok {
-		return nil, Fail("模型沒有回傳圖像")
+		return nil, Fail("model returned no image")
 	}
 	if code := root["code"]; code != nil && !isOKCode(code) {
-		return nil, Fail("模型呼叫失敗")
+		return nil, Fail("model call failed")
 	}
 	result, ok := root["result"].(map[string]any)
 	if !ok {
-		return nil, Fail("模型沒有回傳圖像")
+		return nil, Fail("model returned no image")
 	}
 	encoded, ok := result["image"].(string)
 	if !ok || encoded == "" {
-		return nil, Fail("模型沒有回傳圖像")
+		return nil, Fail("model returned no image")
 	}
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, Fail("模型沒有回傳圖像")
+		return nil, Fail("model returned no image")
 	}
 	return raw, nil
 }

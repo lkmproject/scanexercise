@@ -137,7 +137,7 @@ func TestAPIErrorAndMissingImageAreFailures(t *testing.T) {
 			Header:     make(http.Header),
 		}, nil
 	})}
-	if _, err := reject.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || err.Error() != "模型呼叫失敗" {
+	if _, err := reject.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || err.Error() != "model call failed" {
 		t.Fatalf("reject: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestAPIErrorAndMissingImageAreFailures(t *testing.T) {
 			Header:     make(http.Header),
 		}, nil
 	})}
-	if _, err := empty.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || err.Error() != "模型沒有回傳圖像" {
+	if _, err := empty.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || err.Error() != "model returned no image" {
 		t.Fatalf("empty: %v", err)
 	}
 }

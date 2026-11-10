@@ -63,16 +63,43 @@ API 金鑰只放在伺服器。客戶端不接觸模型。
 - 長邊超過上限時等比縮小（預設 2048，控制上傳體積與延遲）。
 - 單張上傳圖對應一次模型呼叫。
 
+### JSON 回傳
+
+JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`。`code = 200` 代表成功，此時 `reason` 固定為 `success`；其它 `code` 代表失敗，`reason` 為英文說明。圖片與 PDF 下載成功時仍回傳檔案本身；失敗時改回上述 JSON。
+
+| code | 名稱 | reason |
+|---|---|---|
+| 200 | OK | success |
+| 1001 | AuthInvalid | invalid google sign-in |
+| 1002 | AuthUnavailable | auth service unavailable |
+| 1003 | AuthFailed | sign-in failed |
+| 1004 | Unauthorized | unauthorized |
+| 1101 | InvalidRequest | invalid request |
+| 1102 | NoPages | no pages uploaded |
+| 1103 | InvalidImage | cannot read image |
+| 1104 | TooManyPages | too many pages |
+| 1105 | ImageTooLarge | image too large |
+| 1201 | JobNotFound | job not found or expired |
+| 1202 | JobNotReady | result not ready |
+| 1203 | JobFailed | model call failed |
+| 1204 | PageNotFound | page not found |
+| 1301 | PDFFailed | cannot create pdf |
+| 1401 | InsufficientCredits | not enough erases |
+| 1901 | Internal | internal error |
+
 ### 工作
 
 | 方法 | 路徑 | 行為 |
 |---|---|---|
-| `POST` | `/jobs` | 以 `multipart/form-data` 上傳一張或多張頁面圖；可選欄位 `crop=0|1`（預設 `0`），建立工作並回傳工作編號 |
-| `GET` | `/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed` |
+| `POST` | `/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
+| `GET` | `/me` | 回傳目前帳號與剩餘清除次數 |
+| `POST` | `/jobs` | 以 `multipart/form-data` 上傳一張或多張頁面圖；可選欄位 `crop=0|1`（預設 `0`），建立工作並回傳工作編號與扣次後的 `remaining`。按頁預扣次數，次數不足回 `1401`；工作失敗退回 |
+| `GET` | `/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining` |
 | `GET` | `/jobs/{id}/preview` | 成功後回傳各頁結果圖 |
 | `GET` | `/jobs/{id}/pdf` | 成功後回傳 PDF |
+| `POST` | `/pdf` | 以目前頁面圖直接產生 PDF |
 
-狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。
+`/me`、`/jobs` 與 `/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
 
 ### PDF
 

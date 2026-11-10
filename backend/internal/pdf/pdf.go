@@ -12,7 +12,7 @@ const (
 
 func Build(pages [][]byte) ([]byte, error) {
 	if len(pages) == 0 {
-		return nil, fmt.Errorf("沒有頁面")
+		return nil, fmt.Errorf("no pages")
 	}
 	sizes := make([][2]int, len(pages))
 	for i, page := range pages {
@@ -90,12 +90,12 @@ func fitA4(width, height int) (pageWidth, pageHeight, x, y, drawWidth, drawHeigh
 
 func jpegSize(data []byte) (int, int, error) {
 	if len(data) < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-		return 0, 0, fmt.Errorf("結果不是 JPEG")
+		return 0, 0, fmt.Errorf("result is not jpeg")
 	}
 	index := 2
 	for index+1 < len(data) {
 		if data[index] != 0xFF {
-			return 0, 0, fmt.Errorf("結果不是 JPEG")
+			return 0, 0, fmt.Errorf("result is not jpeg")
 		}
 		for index < len(data) && data[index] == 0xFF {
 			index++
@@ -119,5 +119,5 @@ func jpegSize(data []byte) (int, int, error) {
 		}
 		index += length
 	}
-	return 0, 0, fmt.Errorf("結果不是 JPEG")
+	return 0, 0, fmt.Errorf("result is not jpeg")
 }

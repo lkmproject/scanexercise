@@ -1,50 +1,170 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
+	"github.com/gin-gonic/gin"
+
+	"scanexercise/internal/apicode"
+	"scanexercise/internal/auth"
 	"scanexercise/internal/jobs"
 )
 
 type Server struct {
-	store *jobs.Store
+	store    *jobs.Store
+	accounts *auth.Service
+	tokens   *auth.Tokens
 }
 
-func New(store *jobs.Store) http.Handler {
-	s := &Server{store: store}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /jobs", s.createJob)
-	mux.HandleFunc("POST /pdf", s.createPDF)
-	mux.HandleFunc("GET /jobs/{id}", s.getJob)
-	mux.HandleFunc("GET /jobs/{id}/preview", s.listPreviews)
-	mux.HandleFunc("GET /jobs/{id}/preview/{index}", s.getPreview)
-	mux.HandleFunc("GET /jobs/{id}/pdf", s.getPDF)
-	return mux
+type envelope struct {
+	Code   int32  `json:"code"`
+	Reason string `json:"reason"`
+	Data   any    `json:"data"`
 }
 
-func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
-	uploads, ok := readUploadedPages(w, r)
+func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	s := &Server{store: store, accounts: accounts, tokens: tokens}
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	engine.MaxMultipartMemory = 32 << 20
+	_ = engine.SetTrustedProxies(nil)
+
+	engine.POST("/auth/google", s.googleAuth)
+
+	authed := engine.Group("/")
+	authed.Use(s.requireAuth)
+	authed.GET("/me", s.me)
+	authed.POST("/jobs", s.createJob)
+	authed.POST("/pdf", s.createPDF)
+	authed.GET("/jobs/:id/preview/:index", s.getPreview)
+	authed.GET("/jobs/:id/preview", s.listPreviews)
+	authed.GET("/jobs/:id/pdf", s.getPDF)
+	authed.GET("/jobs/:id", s.getJob)
+	return engine
+}
+
+func (s *Server) requireAuth(c *gin.Context) {
+	if s.tokens == nil {
+		rejectAuth(c, apicode.AuthUnavailable)
+		return
+	}
+	header := c.GetHeader("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		rejectAuth(c, apicode.Unauthorized)
+		return
+	}
+	userID, err := s.tokens.Parse(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		rejectAuth(c, apicode.Unauthorized)
+		return
+	}
+	c.Set("userID", userID)
+	c.Next()
+}
+
+func rejectAuth(c *gin.Context, code apicode.Code) {
+	if c.Request.Body != nil {
+		_, _ = io.Copy(io.Discard, c.Request.Body)
+		_ = c.Request.Body.Close()
+	}
+	writeFail(c, code, "")
+	c.Abort()
+}
+
+func (s *Server) googleAuth(c *gin.Context) {
+	var body struct {
+		IDToken string `json:"id_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeFail(c, apicode.InvalidRequest, "unable to read login data")
+		return
+	}
+	user, err := s.accounts.SignInGoogle(c.Request.Context(), body.IDToken)
+	if err != nil {
+		if errors.Is(err, auth.ErrUnavailable) {
+			writeFail(c, apicode.AuthUnavailable, "")
+			return
+		}
+		if errors.Is(err, auth.ErrInvalidToken) {
+			writeFail(c, apicode.AuthInvalid, "")
+			return
+		}
+		log.Printf("google auth: %v", err)
+		writeFail(c, apicode.AuthFailed, "")
+		return
+	}
+	if s.tokens == nil {
+		writeFail(c, apicode.AuthUnavailable, "")
+		return
+	}
+	token, err := s.tokens.Issue(user.ID)
+	if err != nil {
+		log.Printf("jwt issue: %v", err)
+		writeFail(c, apicode.AuthFailed, "")
+		return
+	}
+	writeOK(c, auth.Session{Profile: *user, Token: token})
+}
+
+func (s *Server) me(c *gin.Context) {
+	if s.accounts == nil {
+		writeFail(c, apicode.AuthUnavailable, "")
+		return
+	}
+	profile, err := s.accounts.Me(c.Request.Context(), c.GetString("userID"))
+	if err != nil {
+		if errors.Is(err, auth.ErrUnavailable) {
+			writeFail(c, apicode.AuthUnavailable, "")
+			return
+		}
+		if errors.Is(err, auth.ErrUnauthorized) {
+			writeFail(c, apicode.Unauthorized, "")
+			return
+		}
+		log.Printf("me: %v", err)
+		writeFail(c, apicode.Internal, "")
+		return
+	}
+	writeOK(c, profile)
+}
+
+func (s *Server) createJob(c *gin.Context) {
+	uploads, ok := readUploadedPages(c)
 	if !ok {
 		return
 	}
-	job, err := s.store.Create(uploads, parseCrop(r))
+	job, err := s.store.Create(uploads, parseCrop(c), c.GetString("userID"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeStoreError(c, err)
+		return
+	}
+	if err := s.store.Charge(c.Request.Context(), job); err != nil {
+		s.store.Delete(job.ID)
+		if errors.Is(err, auth.ErrInsufficient) {
+			writeFail(c, apicode.InsufficientCredits, "")
+			return
+		}
+		log.Printf("charge job=%s: %v", job.ID, err)
+		writeFail(c, apicode.Internal, "")
 		return
 	}
 	go s.store.Run(job.ID)
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"id":     job.ID,
-		"status": job.Status,
+	writeOK(c, map[string]any{
+		"id":        job.ID,
+		"status":    job.Status,
+		"remaining": s.store.Remaining(c.Request.Context(), job.UserID),
 	})
 }
 
-func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.loadJob(w, r.PathValue("id"))
+func (s *Server) getJob(c *gin.Context) {
+	job, ok := s.loadJob(c, c.Param("id"))
 	if !ok {
 		return
 	}
@@ -54,6 +174,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		"page_count": job.PageCount,
 		"crop":       job.Crop,
 		"error":      job.Error,
+		"remaining":  s.store.Remaining(c.Request.Context(), job.UserID),
 	}
 	if job.Status == "succeeded" {
 		previews := make([]string, job.PageCount)
@@ -63,11 +184,11 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		body["previews"] = previews
 		body["pdf"] = "/jobs/" + job.ID + "/pdf"
 	}
-	writeJSON(w, http.StatusOK, body)
+	writeOK(c, body)
 }
 
-func (s *Server) listPreviews(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.readyJob(w, r.PathValue("id"))
+func (s *Server) listPreviews(c *gin.Context) {
+	job, ok := s.readyJob(c, c.Param("id"))
 	if !ok {
 		return
 	}
@@ -78,124 +199,122 @@ func (s *Server) listPreviews(w http.ResponseWriter, r *http.Request) {
 			"url":   "/jobs/" + job.ID + "/preview/" + strconv.Itoa(index),
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"pages": pages})
+	writeOK(c, map[string]any{"pages": pages})
 }
 
-func (s *Server) getPreview(w http.ResponseWriter, r *http.Request) {
-	index, err := strconv.Atoi(r.PathValue("index"))
+func (s *Server) getPreview(c *gin.Context) {
+	index, err := strconv.Atoi(c.Param("index"))
 	if err != nil {
-		writeError(w, http.StatusNotFound, "找不到這一頁")
+		writeFail(c, apicode.PageNotFound, "")
 		return
 	}
-	data, err := s.store.Preview(r.PathValue("id"), index)
+	data, err := s.store.Preview(c.Param("id"), index)
 	if err != nil {
-		writeJobError(w, err)
+		writeStoreError(c, err)
 		return
 	}
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	c.Data(http.StatusOK, "image/jpeg", data)
 }
 
-func (s *Server) createPDF(w http.ResponseWriter, r *http.Request) {
-	uploads, ok := readUploadedPages(w, r)
+func (s *Server) createPDF(c *gin.Context) {
+	uploads, ok := readUploadedPages(c)
 	if !ok {
 		return
 	}
 	data, err := s.store.PDFFromUploads(uploads)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeStoreError(c, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Header().Set("Content-Disposition", `attachment; filename="exam.pdf"`)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	c.Header("Content-Disposition", `attachment; filename="exam.pdf"`)
+	c.Data(http.StatusOK, "application/pdf", data)
 }
 
-func (s *Server) getPDF(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
+func (s *Server) getPDF(c *gin.Context) {
+	jobID := c.Param("id")
 	data, err := s.store.PDF(jobID)
 	if err != nil {
-		writeJobError(w, err)
+		writeStoreError(c, err)
 		return
 	}
 	s.store.Delete(jobID)
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Header().Set("Content-Disposition", `attachment; filename="exam.pdf"`)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	c.Header("Content-Disposition", `attachment; filename="exam.pdf"`)
+	c.Data(http.StatusOK, "application/pdf", data)
 }
 
-func (s *Server) loadJob(w http.ResponseWriter, jobID string) (*jobs.Job, bool) {
+func (s *Server) loadJob(c *gin.Context, jobID string) (*jobs.Job, bool) {
 	job, err := s.store.Get(jobID)
-	if err != nil || job == nil {
-		writeError(w, http.StatusNotFound, "工作不存在或已過期")
+	if err != nil {
+		writeStoreError(c, err)
+		return nil, false
+	}
+	if job == nil {
+		writeFail(c, apicode.JobNotFound, "")
 		return nil, false
 	}
 	return job, true
 }
 
-func (s *Server) readyJob(w http.ResponseWriter, jobID string) (*jobs.Job, bool) {
-	job, ok := s.loadJob(w, jobID)
+func (s *Server) readyJob(c *gin.Context, jobID string) (*jobs.Job, bool) {
+	job, ok := s.loadJob(c, jobID)
 	if !ok {
 		return nil, false
 	}
-	if job.Status == "failed" {
-		message := "模型呼叫失敗"
-		if job.Error != nil {
-			message = *job.Error
-		}
-		writeError(w, http.StatusConflict, message)
-		return nil, false
-	}
-	if job.Status != "succeeded" {
-		writeError(w, http.StatusConflict, "結果尚未完成")
+	if err := jobs.RequireReady(job); err != nil {
+		writeStoreError(c, err)
 		return nil, false
 	}
 	return job, true
 }
 
-func writeJobError(w http.ResponseWriter, err error) {
-	message := err.Error()
-	status := http.StatusConflict
+func writeStoreError(c *gin.Context, err error) {
+	code := apicode.Internal
+	reason := err.Error()
 	var jobErr *jobs.Error
 	if errors.As(err, &jobErr) {
-		message = jobErr.Message
+		code = jobErr.Code
+		reason = jobErr.Message
 	}
-	if message == "工作不存在或已過期" || message == "找不到這一頁" {
-		status = http.StatusNotFound
+	writeFail(c, code, reason)
+}
+
+func writeOK(c *gin.Context, data any) {
+	writeEnvelope(c, apicode.OK, apicode.OK.Reason(), data)
+}
+
+func writeFail(c *gin.Context, code apicode.Code, reason string) {
+	if reason == "" {
+		reason = code.Reason()
 	}
-	writeError(w, status, message)
+	writeEnvelope(c, code, reason, nil)
 }
 
-func writeError(w http.ResponseWriter, status int, detail string) {
-	writeJSON(w, status, map[string]string{"detail": detail})
+func writeEnvelope(c *gin.Context, code apicode.Code, reason string, data any) {
+	c.JSON(code.HTTPStatus(), envelope{
+		Code:   int32(code),
+		Reason: reason,
+		Data:   data,
+	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func readUploadedPages(w http.ResponseWriter, r *http.Request) ([][]byte, bool) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "沒有上傳頁面")
+func readUploadedPages(c *gin.Context) ([][]byte, bool) {
+	form, err := c.MultipartForm()
+	if err != nil {
+		writeFail(c, apicode.NoPages, "")
 		return nil, false
 	}
-	files := r.MultipartForm.File["pages"]
+	files := form.File["pages"]
 	uploads := make([][]byte, 0, len(files))
 	for _, header := range files {
 		file, err := header.Open()
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "無法讀取圖片")
+			writeFail(c, apicode.InvalidImage, "")
 			return nil, false
 		}
 		data, err := io.ReadAll(file)
 		file.Close()
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "無法讀取圖片")
+			writeFail(c, apicode.InvalidImage, "")
 			return nil, false
 		}
 		uploads = append(uploads, data)
@@ -203,10 +322,10 @@ func readUploadedPages(w http.ResponseWriter, r *http.Request) ([][]byte, bool) 
 	return uploads, true
 }
 
-func parseCrop(r *http.Request) int {
-	raw := r.FormValue("crop")
+func parseCrop(c *gin.Context) int {
+	raw := c.PostForm("crop")
 	if raw == "" {
-		raw = r.URL.Query().Get("crop")
+		raw = c.Query("crop")
 	}
 	switch raw {
 	case "1", "true", "on":

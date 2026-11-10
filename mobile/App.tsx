@@ -21,16 +21,70 @@ import { cacheDirectory, downloadAsync } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
 
-import { createJob, createPdf, getJob, type Job } from './src/api';
+import { createJob, createPdf, getJob, getMe, isUnauthorized, UnauthorizedError, type Job } from './src/api';
+import AuthModal from './src/AuthModal';
 import { API_BASE_URL, MAX_PAGES } from './src/config';
+import { authHeaders, clearAccessToken, notifyUnauthorized, subscribeUnauthorized } from './src/session';
 import { copy, loadLocale, localeFromDevice, LOCALES, saveLocale, type Locale } from './src/i18n';
 
 type Phase = 'editing' | 'processing' | 'done';
 type Tab = 'home' | 'me';
+type AuthProvider = 'google' | 'apple';
 type Sheet = {
+  id: string;
   original: string;
   processed: string | null;
 };
+
+type DragState = {
+  id: string;
+  from: number;
+  x: number;
+  y: number;
+  uri: string;
+};
+
+const FAKE_ACCOUNT = {
+  name: 'Kwongming',
+  email: 'kwongming@gmail.com',
+  remaining: 0,
+  provider: null as AuthProvider | null,
+};
+
+let sheetSeq = 0;
+function nextSheetId(): string {
+  sheetSeq += 1;
+  return `s${sheetSeq}`;
+}
+
+function GoogleMark() {
+  return (
+    <View style={styles.googleGWrap} accessibilityElementsHidden>
+      <View style={styles.googleGRing} />
+      <View style={styles.googleGGap} />
+      <View style={styles.googleGBar} />
+    </View>
+  );
+}
+
+function RefreshMark() {
+  return (
+    <View style={styles.meRefresh} accessibilityElementsHidden>
+      <View style={styles.meRefreshArc} />
+      <View style={styles.meRefreshArrow} />
+    </View>
+  );
+}
+
+function moveItem<T>(list: T[], from: number, to: number): T[] {
+  if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) {
+    return list;
+  }
+  const next = list.slice();
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
 
 export default function App() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
@@ -44,13 +98,37 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [locale, setLocale] = useState<Locale>(localeFromDevice);
+  const [drag, setDrag] = useState<DragState | null>(null);
+  const [signedIn, setSignedIn] = useState(false);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [account, setAccount] = useState(FAKE_ACCOUNT);
+  const [remainingBusy, setRemainingBusy] = useState(false);
+  const pendingAuth = useRef(null as 'me' | 'erase' | null);
   const t = copy[locale];
   const tRef = useRef(t);
   tRef.current = t;
+  const dragRef = useRef(drag);
+  dragRef.current = drag;
+  const sheetsRef = useRef(sheets);
+  sheetsRef.current = sheets;
+  const gridRef = useRef(null as View | null);
+  const gridFrame = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const { width: windowWidth } = useWindowDimensions();
 
   useEffect(() => {
     void loadLocale().then(setLocale);
   }, []);
+
+  useEffect(() => {
+    return subscribeUnauthorized(openLogin);
+  }, []);
+
+  useEffect(() => {
+    if (!signedIn || tab !== 'me') {
+      return;
+    }
+    refreshRemaining();
+  }, [signedIn, tab]);
 
   useEffect(() => {
     if (phase !== 'processing' || job == null) {
@@ -67,6 +145,7 @@ export default function App() {
             return;
           }
           failures = 0;
+          applyRemaining(next.remaining);
           if (next.status === 'succeeded') {
             settled = true;
             try {
@@ -85,11 +164,16 @@ export default function App() {
                 });
                 setPhase('done');
               }
-            } catch {
-              if (!cancelled) {
-                setError(tRef.current.previewFailed);
-                setPhase('editing');
+            } catch (error) {
+              if (cancelled) {
+                return;
               }
+              if (isUnauthorized(error)) {
+                openLogin();
+                return;
+              }
+              setError(tRef.current.previewFailed);
+              setPhase('editing');
             }
             return;
           }
@@ -99,8 +183,13 @@ export default function App() {
             setPhase('editing');
           }
         })
-        .catch(() => {
+        .catch((error) => {
           if (cancelled || settled) {
+            return;
+          }
+          if (isUnauthorized(error)) {
+            settled = true;
+            openLogin();
             return;
           }
           failures += 1;
@@ -123,7 +212,10 @@ export default function App() {
   function addPages(uris: string[]) {
     setError(null);
     setSheets((current) =>
-      [...current, ...uris.map((original) => ({ original, processed: null }))].slice(0, MAX_PAGES),
+      [
+        ...current,
+        ...uris.map((original) => ({ id: nextSheetId(), original, processed: null })),
+      ].slice(0, MAX_PAGES),
     );
     setTab('home');
   }
@@ -179,17 +271,115 @@ export default function App() {
     setError(null);
     try {
       const created = await createJob(pending, crop);
+      applyRemaining(created.remaining);
       setJob({
         id: created.id,
         status: created.status,
         page_count: pending.length,
         error: null,
+        remaining: created.remaining,
       });
       setPhase('processing');
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t.serverFailed);
+      if (isUnauthorized(caught)) {
+        openLogin();
+        return;
+      }
+      const message = caught instanceof Error ? caught.message : t.serverFailed;
+      setError(message === 'not enough erases' ? t.notEnoughErases : message);
       setPhase('editing');
     }
+  }
+
+  function openLogin() {
+    pendingAuth.current = null;
+    setSignedIn(false);
+    setAccount(FAKE_ACCOUNT);
+    setTab('home');
+    setAuthOpen(true);
+    setPhase((current) => (current === 'processing' ? 'editing' : current));
+  }
+
+  function closeAuth() {
+    pendingAuth.current = null;
+    setAuthOpen(false);
+  }
+
+  function applyRemaining(remaining?: number) {
+    if (remaining == null || !Number.isFinite(remaining)) {
+      return;
+    }
+    setAccount((current) => ({ ...current, remaining }));
+  }
+
+  function refreshRemaining(showBusy = false) {
+    if (showBusy) {
+      if (remainingBusy) {
+        return;
+      }
+      setRemainingBusy(true);
+    }
+    void getMe()
+      .then((me) => {
+        setAccount((current) => ({
+          ...current,
+          name: me.name,
+          email: me.email,
+          remaining: me.remaining,
+        }));
+      })
+      .catch((error) => {
+        if (!isUnauthorized(error)) {
+          return;
+        }
+      })
+      .finally(() => {
+        if (showBusy) {
+          setRemainingBusy(false);
+        }
+      });
+  }
+
+  function finishAuth(next?: { name: string; email: string; remaining: number; provider: AuthProvider }) {
+    setSignedIn(true);
+    setAccount(
+      next == null
+        ? FAKE_ACCOUNT
+        : {
+            ...FAKE_ACCOUNT,
+            name: next.name,
+            email: next.email,
+            remaining: next.remaining,
+            provider: next.provider,
+          },
+    );
+    setAuthOpen(false);
+    const action = pendingAuth.current;
+    pendingAuth.current = null;
+    if (action === 'me') {
+      setTab('me');
+    }
+    if (action === 'erase') {
+      void submit();
+    }
+  }
+
+  function requestAuth(action: 'me' | 'erase') {
+    if (signedIn && authHeaders().Authorization != null) {
+      if (action === 'me') {
+        setTab('me');
+      }
+      if (action === 'erase') {
+        void submit();
+      }
+      return;
+    }
+    pendingAuth.current = action;
+    if (signedIn) {
+      notifyUnauthorized();
+      return;
+    }
+    setAuthOpen(true);
   }
 
   async function sharePdf() {
@@ -217,6 +407,10 @@ export default function App() {
         UTI: 'com.adobe.pdf',
       });
     } catch (caught) {
+      if (isUnauthorized(caught)) {
+        openLogin();
+        return;
+      }
       setError(caught instanceof Error ? caught.message : t.pdfFailed);
     } finally {
       setSharing(false);
@@ -254,6 +448,46 @@ export default function App() {
     }
   }
 
+  function measureGrid() {
+    gridRef.current?.measureInWindow((x, y, width, height) => {
+      gridFrame.current = { x, y, width, height };
+    });
+  }
+
+  function indexAtPoint(pageX: number, pageY: number, count: number): number {
+    const frame = gridFrame.current;
+    if (frame.width <= 0 || count <= 0) {
+      return 0;
+    }
+    const cell = frame.width / 3;
+    const col = Math.min(2, Math.max(0, Math.floor((pageX - frame.x) / cell)));
+    const row = Math.max(0, Math.floor((pageY - frame.y) / cell));
+    return Math.min(count - 1, Math.max(0, row * 3 + col));
+  }
+
+  function onDragMove(event: GestureResponderEvent) {
+    const current = dragRef.current;
+    if (current == null) {
+      return;
+    }
+    const { pageX, pageY } = event.nativeEvent;
+    const to = indexAtPoint(pageX, pageY, sheetsRef.current.length);
+    if (to !== current.from) {
+      setSheets((list) => moveItem(list, current.from, to));
+    }
+    const next = { ...current, from: to, x: pageX, y: pageY };
+    dragRef.current = next;
+    setDrag(next);
+  }
+
+  function endDrag() {
+    if (dragRef.current == null) {
+      return;
+    }
+    dragRef.current = null;
+    setDrag(null);
+  }
+
   const busy = phase === 'processing';
   const processedCount = sheets.filter((sheet) => sheet.processed != null).length;
   const pendingCount = sheets.length - processedCount;
@@ -261,6 +495,7 @@ export default function App() {
   const showBanner = tab === 'home' && phase !== 'processing' && processedCount === 0;
   const showResult = tab === 'home' && processedCount > 0 && phase !== 'processing';
   const showTiles = tab === 'home' && phase !== 'processing' && processedCount === 0;
+  const canReorder = showResult && sheets.length > 1;
 
   function addFromAlbum() {
     if (Platform.OS === 'ios') {
@@ -273,6 +508,7 @@ export default function App() {
   if (selectedPage != null) {
     return (
       <ImageViewer
+        key={sheets.map((sheet) => sheet.id).join('|')}
         pages={shownPages}
         originals={sheets.map((sheet) => sheet.original)}
         startIndex={selectedPage.index}
@@ -298,6 +534,7 @@ export default function App() {
         contentContainerStyle={styles.bodyScroll}
         showsVerticalScrollIndicator={false}
         stickyHeaderIndices={showTiles || showResult ? [1] : []}
+        scrollEnabled={drag == null}
       >
         <View style={styles.headerBlock}>
           <View style={styles.brandRow}>
@@ -361,7 +598,7 @@ export default function App() {
               </Text>
               {pendingCount > 0 ? (
                 <>
-                  <Pressable style={styles.resultPrimary} disabled={busy} onPress={() => void submit()}>
+                  <Pressable style={styles.resultPrimary} disabled={busy} onPress={() => requestAuth('erase')}>
                     <Text style={styles.resultPrimaryLabel}>{t.eraseNew}</Text>
                   </Pressable>
                   <View style={styles.resultCropRow}>
@@ -436,7 +673,7 @@ export default function App() {
                 </Pressable>
                 <View style={[styles.tile, pendingCount === 0 || busy ? styles.tileDisabled : null]}>
                   <View>
-                    <Pressable disabled={busy} onPress={() => void submit()}>
+                    <Pressable disabled={busy} onPress={() => requestAuth('erase')}>
                       <Text style={styles.tileTitle}>{t.erase}</Text>
                       <Text style={styles.tileCopy}>{processedCount > 0 ? t.eraseNew : t.keepPrint}</Text>
                     </Pressable>
@@ -459,7 +696,7 @@ export default function App() {
                   <Pressable
                     style={[styles.iconBtn, styles.pillPurple]}
                     disabled={busy}
-                    onPress={() => void submit()}
+                    onPress={() => requestAuth('erase')}
                   >
                     <View style={styles.play} />
                   </Pressable>
@@ -470,12 +707,78 @@ export default function App() {
 
         <View style={styles.mainBlock}>
           {tab === 'me' ? (
-            <View style={styles.meCard}>
-              <Text style={styles.meTitle}>{t.meTitle}</Text>
+            <View style={styles.mePage}>
+              <View style={styles.meProfile}>
+                <View style={styles.meAvatarWrap}>
+                  <View style={styles.meAvatar}>
+                    <View style={styles.meFace}>
+                      <View style={styles.logoEye} />
+                      <View style={styles.logoEye} />
+                    </View>
+                    <View style={styles.meSmile} />
+                  </View>
+                  {account.provider != null ? (
+                    <View
+                      style={[
+                        styles.meProviderBadge,
+                        account.provider === 'apple' ? styles.meAppleBadge : null,
+                      ]}
+                      accessibilityLabel={account.provider === 'apple' ? 'Apple' : 'Google'}
+                    >
+                      {account.provider === 'apple' ? (
+                        <Text style={styles.meAppleMark}></Text>
+                      ) : (
+                        <GoogleMark />
+                      )}
+                    </View>
+                  ) : null}
+                </View>
+                <View style={styles.meProfileCopy}>
+                  <Text style={styles.meName}>{account.name}</Text>
+                  <Text style={styles.meEmail}>{account.email}</Text>
+                  <View style={styles.meBadge}>
+                    <Text style={styles.meBadgeLabel}>{t.signedInBadge}</Text>
+                  </View>
+                </View>
+              </View>
+              <View style={styles.meTable}>
+                <Pressable
+                  style={styles.meRow}
+                  onPress={() => refreshRemaining(true)}
+                  disabled={remainingBusy}
+                  accessibilityRole="button"
+                  accessibilityLabel={t.remainingErase}
+                >
+                  <Text style={styles.meRowLabel}>{t.remainingErase}</Text>
+                  <View style={styles.meRefreshWrap}>
+                    {remainingBusy ? (
+                      <ActivityIndicator color="#6E6E6E" size="small" />
+                    ) : (
+                      <RefreshMark />
+                    )}
+                  </View>
+                  <View style={styles.meRowValue}>
+                    <Text style={styles.meCount}>{account.remaining}</Text>
+                    {t.remainingTimes.length > 0 ? (
+                      <Text style={styles.meCountUnit}>{t.remainingTimes}</Text>
+                    ) : null}
+                    <Text style={styles.meChevron}>›</Text>
+                  </View>
+                </Pressable>
+                <View style={styles.meDivider} />
+                <Pressable
+                  style={styles.meRow}
+                  onPress={() => {
+                    clearAccessToken();
+                    setSignedIn(false);
+                    setAccount(FAKE_ACCOUNT);
+                    setTab('home');
+                  }}
+                >
+                  <Text style={styles.meRowLabel}>{t.logout}</Text>
+                </Pressable>
+              </View>
               <Text style={styles.meCopy}>{t.meCopy}</Text>
-              <Pressable style={styles.homeChip} onPress={() => setTab('home')}>
-                <Text style={styles.homeChipLabel}>{t.backHome}</Text>
-              </Pressable>
             </View>
           ) : (
             <>
@@ -484,24 +787,61 @@ export default function App() {
               ) : null}
 
               {shownPages.length > 0 ? (
-                <View style={styles.pageGrid}>
-                  {shownPages.map((uri, index) => (
-                    <View key={`${uri}-${index}`} style={styles.gridCell}>
-                      <Pressable style={styles.gridThumb} onPress={() => setSelectedPage({ uri, index })}>
+                <View
+                  ref={gridRef}
+                  collapsable={false}
+                  style={styles.pageGrid}
+                  onLayout={measureGrid}
+                >
+                  {shownPages.map((uri, index) => {
+                    const sheet = sheets[index];
+                    if (sheet == null) {
+                      return null;
+                    }
+                    const dragging = drag?.id === sheet.id;
+                    return (
+                    <View key={sheet.id} style={[styles.gridCell, dragging ? styles.gridCellDragging : null]}>
+                      <Pressable
+                        style={styles.gridThumb}
+                        delayLongPress={220}
+                        onPress={() => setSelectedPage({ uri, index })}
+                        onLongPress={
+                          canReorder && sheet.processed != null
+                            ? (event) => {
+                                const { pageX, pageY } = event.nativeEvent;
+                                const next = {
+                                  id: sheet.id,
+                                  from: index,
+                                  x: pageX,
+                                  y: pageY,
+                                  uri,
+                                };
+                                dragRef.current = next;
+                                setDrag(next);
+                                gridRef.current?.measureInWindow((x, y, width, height) => {
+                                  gridFrame.current = { x, y, width, height };
+                                });
+                              }
+                            : undefined
+                        }
+                        onTouchMove={onDragMove}
+                        onTouchEnd={endDrag}
+                        onTouchCancel={endDrag}
+                      >
                         <Image source={{ uri }} style={styles.gridImage} resizeMode="cover" />
                         <View style={styles.gridIndex}>
                           <Text style={styles.gridIndexLabel}>{index + 1}</Text>
                         </View>
                       </Pressable>
-                      {sheets[index]?.processed != null ? (
+                      {sheet.processed != null ? (
                         <View style={styles.gridDoneDot} />
                       ) : null}
-                      {phase !== 'processing' && sheets[index]?.processed == null && processedCount > 0 ? (
+                      {phase !== 'processing' && sheet.processed == null && processedCount > 0 ? (
                         <View style={styles.gridPending}>
                           <Text style={styles.gridPendingLabel}>{t.pending}</Text>
                         </View>
                       ) : null}
-                      {phase !== 'processing' ? (
+                      {phase !== 'processing' && drag == null ? (
                         <Pressable
                           style={styles.gridRemove}
                           onPress={() => removeSheet(index)}
@@ -511,7 +851,8 @@ export default function App() {
                         </Pressable>
                       ) : null}
                     </View>
-                  ))}
+                    );
+                  })}
                 </View>
               ) : null}
 
@@ -529,6 +870,23 @@ export default function App() {
         </View>
       </ScrollView>
 
+      {drag != null ? (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.dragGhost,
+            {
+              width: Math.max(72, (windowWidth - 40) / 3 - 8),
+              height: Math.max(72, (windowWidth - 40) / 3 - 8),
+              left: drag.x - Math.max(72, (windowWidth - 40) / 3 - 8) / 2,
+              top: drag.y - Math.max(72, (windowWidth - 40) / 3 - 8) / 2,
+            },
+          ]}
+        >
+          <Image source={{ uri: drag.uri }} style={styles.dragGhostImage} resizeMode="cover" />
+        </View>
+      ) : null}
+
       <View style={styles.tabDock}>
         <View style={styles.tabBar}>
           <Pressable style={styles.tabItem} onPress={() => setTab('home')}>
@@ -541,7 +899,7 @@ export default function App() {
             <Text style={[styles.tabLabel, tab === 'home' ? styles.tabOn : null]}>{t.home}</Text>
           </Pressable>
           <View style={styles.tabCamSlot} />
-          <Pressable style={styles.tabItem} onPress={() => setTab('me')}>
+          <Pressable style={styles.tabItem} onPress={() => requestAuth('me')}>
             <View style={styles.personIcon}>
               <View style={[styles.personHead, tab === 'me' ? styles.tabIconOnBorder : styles.tabIconOffBorder]} />
               <View style={[styles.personBody, tab === 'me' ? styles.tabIconOnBorder : styles.tabIconOffBorder]} />
@@ -614,6 +972,14 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      <AuthModal
+        visible={authOpen}
+        locale={locale}
+        onChangeLocale={changeLocale}
+        onClose={closeAuth}
+        onSignedIn={finishAuth}
+      />
     </View>
   );
 }
@@ -626,7 +992,13 @@ async function loadPreviews(job: Job): Promise<string[]> {
   const uris: string[] = [];
   for (const [index, path] of paths.entries()) {
     const destination = `${cacheDirectory}exam-${job.id}-${index}.jpg`;
-    const downloaded = await downloadAsync(`${API_BASE_URL}${path}`, destination);
+    const downloaded = await downloadAsync(`${API_BASE_URL}${path}`, destination, {
+      headers: authHeaders(),
+    });
+    if (downloaded.status === 401) {
+      notifyUnauthorized();
+      throw new UnauthorizedError();
+    }
     if (downloaded.status !== 200) {
       throw new Error('無法取得預覽');
     }
@@ -1230,6 +1602,26 @@ const styles = StyleSheet.create({
     aspectRatio: 1,
     padding: 4,
   },
+  gridCellDragging: {
+    opacity: 0.35,
+  },
+  dragGhost: {
+    position: 'absolute',
+    zIndex: 40,
+    borderRadius: 16,
+    overflow: 'hidden',
+    backgroundColor: '#FFFFFF',
+    transform: [{ scale: 1.06 }],
+    shadowColor: '#111111',
+    shadowOpacity: 0.22,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 10,
+  },
+  dragGhostImage: {
+    width: '100%',
+    height: '100%',
+  },
   gridThumb: {
     flex: 1,
     borderRadius: 16,
@@ -1441,21 +1833,214 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
-  meCard: {
+  mePage: {
+    gap: 14,
+  },
+  meProfile: {
     backgroundColor: '#FFFFFF',
     borderRadius: 24,
-    padding: 22,
+    padding: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
   },
-  meTitle: {
-    fontSize: 22,
+  meAvatarWrap: {
+    width: 56,
+    height: 56,
+  },
+  meAvatar: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#111111',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  meProviderBadge: {
+    position: 'absolute',
+    right: -3,
+    bottom: -3,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#111111',
+    shadowOpacity: 0.12,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 2,
+  },
+  meAppleBadge: {
+    backgroundColor: '#111111',
+    borderColor: '#FFFFFF',
+  },
+  meAppleMark: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: -1,
+  },
+  googleGWrap: {
+    width: 14,
+    height: 14,
+  },
+  googleGRing: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 3,
+    borderTopColor: '#EA4335',
+    borderRightColor: '#4285F4',
+    borderBottomColor: '#34A853',
+    borderLeftColor: '#FBBC05',
+  },
+  googleGGap: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    width: 8,
+    height: 7,
+    backgroundColor: '#FFFFFF',
+  },
+  googleGBar: {
+    position: 'absolute',
+    top: 5.5,
+    right: 0,
+    width: 8,
+    height: 3,
+    backgroundColor: '#4285F4',
+    borderTopRightRadius: 1,
+    borderBottomRightRadius: 1,
+  },
+  meFace: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#FFD600',
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
+    alignItems: 'center',
+    paddingTop: 6,
+  },
+  meSmile: {
+    width: 12,
+    height: 6,
+    borderBottomLeftRadius: 8,
+    borderBottomRightRadius: 8,
+    borderWidth: 2,
+    borderTopWidth: 0,
+    borderColor: '#111111',
+    marginTop: -8,
+  },
+  meProfileCopy: {
+    flex: 1,
+  },
+  meName: {
+    fontSize: 20,
     fontWeight: '800',
     color: '#111111',
   },
-  meCopy: {
-    marginTop: 10,
-    fontSize: 15,
-    lineHeight: 22,
+  meEmail: {
+    marginTop: 4,
+    fontSize: 14,
     color: '#6E6E6E',
+  },
+  meBadge: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    backgroundColor: '#FFD600',
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  meBadgeLabel: {
+    color: '#111111',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  meTable: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    paddingHorizontal: 18,
+  },
+  meRow: {
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  meRowLabel: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#111111',
+  },
+  meRefreshWrap: {
+    marginLeft: 8,
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  meRefresh: {
+    width: 14,
+    height: 14,
+  },
+  meRefreshArc: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#6E6E6E',
+    borderTopColor: 'transparent',
+    transform: [{ rotate: '20deg' }],
+  },
+  meRefreshArrow: {
+    position: 'absolute',
+    top: 0,
+    right: 1,
+    width: 0,
+    height: 0,
+    borderLeftWidth: 3.5,
+    borderRightWidth: 3.5,
+    borderBottomWidth: 5,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#6E6E6E',
+  },
+  meRowValue: {
+    marginLeft: 'auto',
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 4,
+  },
+  meCount: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#111111',
+  },
+  meCountUnit: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#111111',
+  },
+  meChevron: {
+    marginLeft: 4,
+    fontSize: 22,
+    color: '#C8C8C8',
+    fontWeight: '500',
+  },
+  meDivider: {
+    height: 1,
+    backgroundColor: '#EFEFEF',
+  },
+  meCopy: {
+    marginTop: 4,
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#8A8A8A',
   },
   homeChip: {
     marginTop: 20,

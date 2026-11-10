@@ -1,10 +1,12 @@
 package jobs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"scanexercise/internal/apicode"
 	"scanexercise/internal/config"
 	"scanexercise/internal/editor"
 	"scanexercise/internal/pdf"
@@ -21,6 +24,7 @@ import (
 var jobIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 type Error struct {
+	Code    apicode.Code
 	Message string
 }
 
@@ -28,23 +32,36 @@ func (e *Error) Error() string {
 	return e.Message
 }
 
-func fail(message string) error {
-	return &Error{Message: message}
+func fail(code apicode.Code, message string) error {
+	if message == "" {
+		message = code.Reason()
+	}
+	return &Error{Code: code, Message: message}
 }
 
 type Job struct {
 	ID        string  `json:"id"`
+	UserID    string  `json:"user_id,omitempty"`
 	Status    string  `json:"status"`
 	PageCount int     `json:"page_count"`
 	Crop      int     `json:"crop"`
+	Charged   int     `json:"charged,omitempty"`
+	Refunded  bool    `json:"refunded,omitempty"`
 	Error     *string `json:"error"`
 	CreatedAt string  `json:"created_at"`
 	ExpiresAt string  `json:"expires_at"`
 }
 
+type Wallet interface {
+	Reserve(ctx context.Context, userID string, pages int) error
+	Refund(ctx context.Context, userID string, pages int) error
+	Balance(ctx context.Context, userID string) (int, error)
+}
+
 type Store struct {
 	settings config.Settings
 	editor   editor.Editor
+	wallet   Wallet
 	root     string
 	mu       sync.Mutex
 }
@@ -55,36 +72,40 @@ func NewStore(settings config.Settings, ed editor.Editor) *Store {
 	return &Store{settings: settings, editor: ed, root: root}
 }
 
-func (s *Store) Create(uploads [][]byte, crop int) (*Job, error) {
+func (s *Store) SetWallet(wallet Wallet) {
+	s.wallet = wallet
+}
+
+func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) {
 	s.Cleanup()
 	if len(uploads) == 0 {
-		return nil, fail("沒有上傳頁面")
+		return nil, fail(apicode.NoPages, "")
 	}
 	if len(uploads) > s.settings.MaxPages {
-		return nil, fail("一次最多 " + strconv.Itoa(s.settings.MaxPages) + " 頁")
+		return nil, fail(apicode.TooManyPages, "at most "+strconv.Itoa(s.settings.MaxPages)+" pages")
 	}
 	for _, upload := range uploads {
 		if len(upload) > s.settings.MaxUploadBytes {
-			return nil, fail("圖片太大")
+			return nil, fail(apicode.ImageTooLarge, "")
 		}
 	}
 	prepared := make([][]byte, 0, len(uploads))
 	for _, upload := range uploads {
 		page, err := preprocess.PreparePage(upload, s.settings.MaxLongEdge)
 		if err != nil {
-			return nil, fail(err.Error())
+			return nil, fail(apicode.InvalidImage, err.Error())
 		}
 		prepared = append(prepared, page)
 	}
 	jobID := hexUUID()
 	directory := s.jobDir(jobID)
 	if err := os.MkdirAll(filepath.Join(directory, "input"), 0o755); err != nil {
-		return nil, fail("無法建立工作")
+		return nil, fail(apicode.Internal, "cannot create job")
 	}
 	for index, page := range prepared {
 		path := filepath.Join(directory, "input", strconv.Itoa(index)+".jpg")
 		if err := os.WriteFile(path, page, 0o644); err != nil {
-			return nil, fail("無法建立工作")
+			return nil, fail(apicode.Internal, "cannot create job")
 		}
 	}
 	if crop != 1 {
@@ -93,6 +114,7 @@ func (s *Store) Create(uploads [][]byte, crop int) (*Job, error) {
 	now := time.Now().UTC()
 	job := &Job{
 		ID:        jobID,
+		UserID:    userID,
 		Status:    "pending",
 		PageCount: len(prepared),
 		Crop:      crop,
@@ -101,32 +123,62 @@ func (s *Store) Create(uploads [][]byte, crop int) (*Job, error) {
 		ExpiresAt: now.Add(time.Duration(s.settings.RetentionHours) * time.Hour).Format(time.RFC3339Nano),
 	}
 	if err := s.write(job); err != nil {
-		return nil, fail("無法建立工作")
+		return nil, fail(apicode.Internal, "cannot create job")
 	}
 	return job, nil
 }
 
+func (s *Store) Charge(ctx context.Context, job *Job) error {
+	if s.wallet == nil || job == nil || job.PageCount <= 0 {
+		return nil
+	}
+	if err := s.wallet.Reserve(ctx, job.UserID, job.PageCount); err != nil {
+		return err
+	}
+	job.Charged = job.PageCount
+	if err := s.write(job); err != nil {
+		if refundErr := s.wallet.Refund(ctx, job.UserID, job.PageCount); refundErr != nil {
+			log.Printf("refund after charge write failed job=%s: %v", job.ID, refundErr)
+		}
+		job.Charged = 0
+		return err
+	}
+	return nil
+}
+
+func (s *Store) Remaining(ctx context.Context, userID string) int {
+	if s.wallet == nil || userID == "" {
+		return 0
+	}
+	remaining, err := s.wallet.Balance(ctx, userID)
+	if err != nil {
+		log.Printf("balance user=%s: %v", userID, err)
+		return 0
+	}
+	return remaining
+}
+
 func (s *Store) PDFFromUploads(uploads [][]byte) ([]byte, error) {
 	if len(uploads) == 0 {
-		return nil, fail("沒有上傳頁面")
+		return nil, fail(apicode.NoPages, "")
 	}
 	if len(uploads) > s.settings.MaxPages {
-		return nil, fail("一次最多 " + strconv.Itoa(s.settings.MaxPages) + " 頁")
+		return nil, fail(apicode.TooManyPages, "at most "+strconv.Itoa(s.settings.MaxPages)+" pages")
 	}
 	prepared := make([][]byte, 0, len(uploads))
 	for _, upload := range uploads {
 		if len(upload) > s.settings.MaxUploadBytes {
-			return nil, fail("圖片太大")
+			return nil, fail(apicode.ImageTooLarge, "")
 		}
 		page, err := preprocess.PreparePage(upload, s.settings.MaxLongEdge)
 		if err != nil {
-			return nil, fail(err.Error())
+			return nil, fail(apicode.InvalidImage, err.Error())
 		}
 		prepared = append(prepared, page)
 	}
 	data, err := pdf.Build(prepared)
 	if err != nil {
-		return nil, fail("無法產生 PDF")
+		return nil, fail(apicode.PDFFailed, "")
 	}
 	return data, nil
 }
@@ -145,12 +197,12 @@ func (s *Store) Run(jobID string) {
 	for index := 0; index < job.PageCount; index++ {
 		source, err := os.ReadFile(filepath.Join(directory, "input", strconv.Itoa(index)+".jpg"))
 		if err != nil {
-			s.markFailed(job, "模型呼叫失敗")
+			s.markFailed(job, "model call failed")
 			return
 		}
 		edited, err := s.editor.Edit(source, editor.Options{Crop: job.Crop})
 		if err != nil {
-			message := "模型呼叫失敗"
+			message := "model call failed"
 			var edErr *editor.Error
 			if errors.As(err, &edErr) {
 				message = edErr.Message
@@ -163,17 +215,17 @@ func (s *Store) Run(jobID string) {
 	for index, page := range pages {
 		path := filepath.Join(outputDir, strconv.Itoa(index)+".jpg")
 		if err := os.WriteFile(path, page, 0o644); err != nil {
-			s.markFailed(job, "模型呼叫失敗")
+			s.markFailed(job, "model call failed")
 			return
 		}
 	}
 	pdfBytes, err := pdf.Build(pages)
 	if err != nil {
-		s.markFailed(job, "模型呼叫失敗")
+		s.markFailed(job, "model call failed")
 		return
 	}
 	if err := os.WriteFile(filepath.Join(directory, "result.pdf"), pdfBytes, 0o644); err != nil {
-		s.markFailed(job, "模型呼叫失敗")
+		s.markFailed(job, "model call failed")
 		return
 	}
 	job.Status = "succeeded"
@@ -197,15 +249,15 @@ func (s *Store) Preview(jobID string, index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := requireReady(job); err != nil {
+	if err := RequireReady(job); err != nil {
 		return nil, err
 	}
 	if index < 0 || index >= job.PageCount {
-		return nil, fail("找不到這一頁")
+		return nil, fail(apicode.PageNotFound, "")
 	}
 	data, err := os.ReadFile(filepath.Join(s.jobDir(jobID), "output", strconv.Itoa(index)+".jpg"))
 	if err != nil {
-		return nil, fail("找不到這一頁")
+		return nil, fail(apicode.PageNotFound, "")
 	}
 	return data, nil
 }
@@ -215,12 +267,12 @@ func (s *Store) PDF(jobID string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := requireReady(job); err != nil {
+	if err := RequireReady(job); err != nil {
 		return nil, err
 	}
 	data, err := os.ReadFile(filepath.Join(s.jobDir(jobID), "result.pdf"))
 	if err != nil {
-		return nil, fail("結果尚未完成")
+		return nil, fail(apicode.JobNotReady, "")
 	}
 	return data, nil
 }
@@ -246,21 +298,34 @@ func (s *Store) markFailed(job *Job, message string) {
 	_ = os.Remove(filepath.Join(s.jobDir(job.ID), "result.pdf"))
 	job.Status = "failed"
 	job.Error = &message
+	s.refund(job)
 	_ = s.write(job)
 }
 
-func requireReady(job *Job) error {
+func (s *Store) refund(job *Job) {
+	if s.wallet == nil || job == nil || job.Refunded || job.Charged <= 0 || job.UserID == "" {
+		return
+	}
+	if err := s.wallet.Refund(context.Background(), job.UserID, job.Charged); err != nil {
+		log.Printf("refund job=%s: %v", job.ID, err)
+		return
+	}
+	job.Refunded = true
+}
+
+func RequireReady(job *Job) error {
 	if job == nil {
-		return fail("工作不存在或已過期")
+		return fail(apicode.JobNotFound, "")
 	}
 	if job.Status == "failed" {
+		message := apicode.JobFailed.Reason()
 		if job.Error != nil {
-			return fail(*job.Error)
+			message = *job.Error
 		}
-		return fail("模型呼叫失敗")
+		return fail(apicode.JobFailed, message)
 	}
 	if job.Status != "succeeded" {
-		return fail("結果尚未完成")
+		return fail(apicode.JobNotReady, "")
 	}
 	return nil
 }
@@ -278,6 +343,9 @@ func (s *Store) deleteIfExpired(jobID string) error {
 		return nil
 	}
 	if !expiresAt.After(time.Now().UTC()) {
+		if job.Status != "succeeded" {
+			s.refund(job)
+		}
 		s.Delete(jobID)
 	}
 	return nil
@@ -289,7 +357,7 @@ func (s *Store) jobDir(jobID string) string {
 
 func (s *Store) write(job *Job) error {
 	if !jobIDPattern.MatchString(job.ID) {
-		return fail("工作不存在或已過期")
+		return fail(apicode.JobNotFound, "")
 	}
 	payload, err := json.Marshal(job)
 	if err != nil {
@@ -302,7 +370,7 @@ func (s *Store) write(job *Job) error {
 
 func (s *Store) read(jobID string) (*Job, error) {
 	if !jobIDPattern.MatchString(jobID) {
-		return nil, fail("工作不存在或已過期")
+		return nil, fail(apicode.JobNotFound, "")
 	}
 	path := filepath.Join(s.jobDir(jobID), "meta.json")
 	s.mu.Lock()
