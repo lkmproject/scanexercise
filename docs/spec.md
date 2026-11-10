@@ -65,7 +65,7 @@ API 金鑰只放在伺服器。客戶端不接觸模型。
 
 ### JSON 回傳
 
-JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`。`code = 200` 代表成功，此時 `reason` 固定為 `success`；其它 `code` 代表失敗，`reason` 為英文說明。圖片與 PDF 下載成功時仍回傳檔案本身；失敗時改回上述 JSON。
+JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`，HTTP 狀態固定 `200`。`code = 200` 代表成功，此時 `reason` 固定為 `success`；其它 `code` 代表失敗，`reason` 為英文說明。圖片與 PDF 下載成功時仍回傳檔案本身（HTTP 200）；失敗時改回上述 JSON（仍是 HTTP 200，以 `code` 判斷）。
 
 | code | 名稱 | reason |
 |---|---|---|

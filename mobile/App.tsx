@@ -17,11 +17,11 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { scanDocument } from 'expo-document-scanner';
-import { cacheDirectory, downloadAsync } from 'expo-file-system/legacy';
+import { cacheDirectory, downloadAsync, readAsStringAsync } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
 
-import { createJob, createPdf, getJob, getMe, isUnauthorized, UnauthorizedError, type Job } from './src/api';
+import { createJob, createPdf, failFromEnvelope, getJob, getMe, isUnauthorized, type Job } from './src/api';
 import AuthModal from './src/AuthModal';
 import { API_BASE_URL, MAX_PAGES } from './src/config';
 import { authHeaders, clearAccessToken, notifyUnauthorized, subscribeUnauthorized } from './src/session';
@@ -995,12 +995,14 @@ async function loadPreviews(job: Job): Promise<string[]> {
     const downloaded = await downloadAsync(`${API_BASE_URL}${path}`, destination, {
       headers: authHeaders(),
     });
-    if (downloaded.status === 401) {
-      notifyUnauthorized();
-      throw new UnauthorizedError();
-    }
-    if (downloaded.status !== 200) {
-      throw new Error('無法取得預覽');
+    const contentType =
+      downloaded.mimeType ??
+      downloaded.headers?.['Content-Type'] ??
+      downloaded.headers?.['content-type'] ??
+      '';
+    if (contentType.includes('application/json')) {
+      const raw = await readAsStringAsync(downloaded.uri);
+      failFromEnvelope(JSON.parse(raw) as { code?: number; reason?: string });
     }
     uris.push(downloaded.uri);
   }

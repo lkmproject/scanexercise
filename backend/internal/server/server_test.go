@@ -350,9 +350,12 @@ func TestSuccessReturnsEditedPagesInOrderThenDeletesAfterPDF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer missing.Body.Close()
-	if missing.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 after pdf, got %d", missing.StatusCode)
+	payload := decodeEnvelope(t, missing)
+	if missing.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after pdf, got %d", missing.StatusCode)
+	}
+	if codeOf(payload) != int32(apicode.JobNotFound) {
+		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
 	}
 }
 
@@ -370,21 +373,23 @@ func TestModelFailureDoesNotReturnTheOriginal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer preview.Body.Close()
-	if preview.StatusCode != http.StatusConflict {
+	previewPayload := decodeEnvelope(t, preview)
+	if preview.StatusCode != http.StatusOK {
 		t.Fatalf("preview status %d", preview.StatusCode)
 	}
-	previewBytes, _ := io.ReadAll(preview.Body)
-	if bytes.Contains(previewBytes, original) {
-		t.Fatal("original leaked")
+	if codeOf(previewPayload) != int32(apicode.JobFailed) {
+		t.Fatalf("preview code %v", previewPayload["code"])
 	}
 	pdfResp, err := client.Get(ts.URL + "/jobs/" + jobID + "/pdf")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pdfResp.Body.Close()
-	if pdfResp.StatusCode != http.StatusConflict {
+	pdfPayload := decodeEnvelope(t, pdfResp)
+	if pdfResp.StatusCode != http.StatusOK {
 		t.Fatalf("pdf status %d", pdfResp.StatusCode)
+	}
+	if codeOf(pdfPayload) != int32(apicode.JobFailed) {
+		t.Fatalf("pdf code %v", pdfPayload["code"])
 	}
 }
 
@@ -403,9 +408,12 @@ func TestSecondPageFailureDiscardsPartialOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer preview.Body.Close()
-	if preview.StatusCode != http.StatusConflict {
+	previewPayload := decodeEnvelope(t, preview)
+	if preview.StatusCode != http.StatusOK {
 		t.Fatalf("preview status %d", preview.StatusCode)
+	}
+	if codeOf(previewPayload) != int32(apicode.JobFailed) {
+		t.Fatalf("preview code %v", previewPayload["code"])
 	}
 }
 
@@ -416,14 +424,17 @@ func TestRejectsTooManyPagesAndUnreadableImages(t *testing.T) {
 		tooMany[i] = jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)
 	}
 	resp := postPages(t, client, ts.URL, tooMany)
-	if resp.StatusCode != http.StatusBadRequest {
+	tooManyPayload := decodeEnvelope(t, resp)
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("too many status %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if codeOf(tooManyPayload) != int32(apicode.TooManyPages) {
+		t.Fatalf("too many code %v", tooManyPayload["code"])
+	}
 
 	invalid := postPages(t, client, ts.URL, [][]byte{[]byte("not-an-image")})
 	payload := decodeEnvelope(t, invalid)
-	if invalid.StatusCode != http.StatusBadRequest {
+	if invalid.StatusCode != http.StatusOK {
 		t.Fatalf("invalid status %d", invalid.StatusCode)
 	}
 	if codeOf(payload) != int32(apicode.InvalidImage) {
@@ -477,9 +488,12 @@ func TestExpiredJobIsRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer gone.Body.Close()
-	if gone.StatusCode != http.StatusNotFound {
+	gonePayload := decodeEnvelope(t, gone)
+	if gone.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", gone.StatusCode)
+	}
+	if codeOf(gonePayload) != int32(apicode.JobNotFound) {
+		t.Fatalf("code %v reason %v", gonePayload["code"], gonePayload["reason"])
 	}
 	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
 		t.Fatal("meta should be deleted")
@@ -593,10 +607,10 @@ func TestCreateJobUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
+	payload := decodeEnvelope(t, resp)
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	payload := decodeEnvelope(t, resp)
 	if codeOf(payload) != int32(apicode.Unauthorized) {
 		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
 	}
@@ -612,7 +626,7 @@ func TestCreateJobRejectsInsufficientCredits(t *testing.T) {
 	page := jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)
 	resp := postPages(t, client, ts.URL, [][]byte{page, page})
 	payload := decodeEnvelope(t, resp)
-	if resp.StatusCode != http.StatusForbidden {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d body %#v", resp.StatusCode, payload)
 	}
 	if codeOf(payload) != int32(apicode.InsufficientCredits) {

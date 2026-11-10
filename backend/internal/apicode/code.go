@@ -39,24 +39,7 @@ const (
 )
 
 func (c Code) HTTPStatus() int {
-	switch c {
-	case OK:
-		return http.StatusOK
-	case AuthInvalid, Unauthorized:
-		return http.StatusUnauthorized
-	case AuthUnavailable:
-		return http.StatusServiceUnavailable
-	case JobNotFound, PageNotFound:
-		return http.StatusNotFound
-	case JobNotReady, JobFailed:
-		return http.StatusConflict
-	case InsufficientCredits:
-		return http.StatusForbidden
-	case AuthFailed, PDFFailed, Internal:
-		return http.StatusInternalServerError
-	default:
-		return http.StatusBadRequest
-	}
+	return http.StatusOK
 }
 
 func (c Code) Reason() string {

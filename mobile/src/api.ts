@@ -118,12 +118,6 @@ export async function createPdf(uris: string[], destination: string): Promise<vo
     await readJson(response);
     throw new Error('request failed');
   }
-  if (response.status === 401) {
-    throwUnauthorized();
-  }
-  if (!response.ok) {
-    throw new Error('request failed');
-  }
   const bytes = new Uint8Array(await response.arrayBuffer());
   await writeAsStringAsync(destination, bytesToBase64(bytes), {
     encoding: EncodingType.Base64,
@@ -146,21 +140,22 @@ function bytesToBase64(bytes: Uint8Array): string {
   return output;
 }
 
+export function failFromEnvelope(payload: { code?: number; reason?: string }): never {
+  if (payload.code === ApiCode.Unauthorized) {
+    throwUnauthorized();
+  }
+  throw new Error(payload.reason || 'request failed');
+}
+
 async function readJson<T>(response: Response): Promise<T> {
   let payload: Envelope<T>;
   try {
     payload = (await response.json()) as Envelope<T>;
   } catch {
-    if (response.status === 401) {
-      throwUnauthorized();
-    }
     throw new Error('request failed');
   }
-  if (payload.code === ApiCode.Unauthorized || response.status === 401) {
-    throwUnauthorized();
-  }
   if (payload.code !== ApiCode.OK || payload.data == null) {
-    throw new Error(payload.reason || 'request failed');
+    failFromEnvelope(payload);
   }
   return payload.data;
 }
