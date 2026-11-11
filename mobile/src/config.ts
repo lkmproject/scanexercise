@@ -1,5 +1,5 @@
 export const API_BASE_URL = (
-  process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://192.168.1.24:8000'
+  process.env.EXPO_PUBLIC_API_BASE_URL ?? 'https://94w5nmm1gc.execute-api.ap-southeast-1.amazonaws.com/scanexercise'
 ).replace(/\/$/, '');
 
 export const MAX_PAGES = 20;

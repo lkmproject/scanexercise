@@ -12,6 +12,12 @@ import (
 	xdraw "golang.org/x/image/draw"
 )
 
+const (
+	jpegQuality    = 95
+	jpegMaxBytes   = 6_000_000
+	jpegMinQuality = 70
+)
+
 func PreparePage(data []byte, maxLongEdge int) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("cannot read image")
@@ -39,7 +45,7 @@ func ToJPEG(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return encodeJPEGAt(img, 90)
+	return encodeJPEGAt(img, jpegQuality)
 }
 
 func decodeImage(data []byte, autoOrient bool) (image.Image, error) {
@@ -60,13 +66,13 @@ func resize(src image.Image, width, height int) image.Image {
 }
 
 func encodeJPEG(img image.Image) ([]byte, error) {
-	quality := 90
+	quality := jpegQuality
 	encoded, err := encodeJPEGAt(img, quality)
 	if err != nil {
 		return nil, err
 	}
-	for len(encoded) > 4_000_000 && quality > 50 {
-		quality -= 10
+	for len(encoded) > jpegMaxBytes && quality > jpegMinQuality {
+		quality -= 5
 		encoded, err = encodeJPEGAt(img, quality)
 		if err != nil {
 			return nil, err

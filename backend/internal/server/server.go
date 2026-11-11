@@ -21,13 +21,15 @@ type Server struct {
 	tokens   *auth.Tokens
 }
 
+const APIPrefix = "/scanexercise"
+
 type envelope struct {
 	Code   int32  `json:"code"`
 	Reason string `json:"reason"`
 	Data   any    `json:"data"`
 }
 
-func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) http.Handler {
+func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{store: store, accounts: accounts, tokens: tokens}
 	engine := gin.New()
@@ -35,9 +37,10 @@ func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) http.Ha
 	engine.MaxMultipartMemory = 32 << 20
 	_ = engine.SetTrustedProxies(nil)
 
-	engine.POST("/auth/google", s.googleAuth)
+	root := engine.Group(APIPrefix)
+	root.POST("/auth/google", s.googleAuth)
 
-	authed := engine.Group("/")
+	authed := root.Group("/")
 	authed.Use(s.requireAuth)
 	authed.GET("/me", s.me)
 	authed.POST("/jobs", s.createJob)
@@ -155,7 +158,7 @@ func (s *Server) createJob(c *gin.Context) {
 		writeFail(c, apicode.Internal, "")
 		return
 	}
-	go s.store.Run(job.ID)
+	s.store.Start(job.ID)
 	writeOK(c, map[string]any{
 		"id":        job.ID,
 		"status":    job.Status,

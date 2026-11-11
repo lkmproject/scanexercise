@@ -232,7 +232,7 @@ export default function App() {
     }
     try {
       const result = await scanDocument({
-        quality: 0.92,
+        quality: 0.95,
         maxNumDocuments: MAX_PAGES - sheets.length,
         galleryImportAllowed: true,
       });
@@ -253,7 +253,7 @@ export default function App() {
       mediaTypes: ['images'],
       allowsMultipleSelection: true,
       selectionLimit: MAX_PAGES - sheets.length,
-      quality: 0.92,
+      quality: 0.95,
       preferredAssetRepresentationMode:
         ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
     });

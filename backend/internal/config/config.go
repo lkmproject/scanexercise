@@ -28,7 +28,7 @@ func Load() Settings {
 		DataDir:              getenv("DATA_DIR", "data"),
 		MaxPages:             getenvInt("MAX_PAGES", 20),
 		RetentionHours:       getenvInt("RETENTION_HOURS", 24),
-		MaxLongEdge:          getenvInt("MAX_LONG_EDGE", 2048),
+		MaxLongEdge:          getenvInt("MAX_LONG_EDGE", 2560),
 		TextInTimeoutSeconds: getenvInt("TEXTIN_TIMEOUT_SECONDS", 180),
 		MaxUploadBytes:       20 * 1024 * 1024,
 		GoogleWebClientID: getenv(

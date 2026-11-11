@@ -4,15 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"log"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"scanexercise/internal/apicode"
 	"scanexercise/internal/config"
@@ -58,22 +57,46 @@ type Wallet interface {
 	Balance(ctx context.Context, userID string) (int, error)
 }
 
+type fileStore interface {
+	writeMeta(ctx context.Context, job *Job) error
+	readMeta(ctx context.Context, jobID string) (*Job, error)
+	writeBlob(ctx context.Context, jobID, rel string, data []byte) error
+	readBlob(ctx context.Context, jobID, rel string) ([]byte, error)
+	remove(ctx context.Context, jobID string) error
+	removeBlobs(ctx context.Context, jobID string, rels ...string) error
+	listIDs(ctx context.Context) []string
+}
+
 type Store struct {
-	settings config.Settings
-	editor   editor.Editor
-	wallet   Wallet
-	root     string
-	mu       sync.Mutex
+	settings   config.Settings
+	editor     editor.Editor
+	wallet     Wallet
+	files      fileStore
+	asyncStart func(jobID string) error
 }
 
 func NewStore(settings config.Settings, ed editor.Editor) *Store {
-	root := filepath.Join(settings.DataDir, "jobs")
-	_ = os.MkdirAll(root, 0o755)
-	return &Store{settings: settings, editor: ed, root: root}
+	return &Store{
+		settings: settings,
+		editor:   ed,
+		files:    newDiskStore(filepath.Join(settings.DataDir, "jobs")),
+	}
+}
+
+func NewAWSStore(settings config.Settings, ed editor.Editor, cfg aws.Config) *Store {
+	return &Store{
+		settings: settings,
+		editor:   ed,
+		files:    newAWSStore(cfg),
+	}
 }
 
 func (s *Store) SetWallet(wallet Wallet) {
 	s.wallet = wallet
+}
+
+func (s *Store) SetAsyncStart(start func(jobID string) error) {
+	s.asyncStart = start
 }
 
 func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) {
@@ -98,13 +121,10 @@ func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) 
 		prepared = append(prepared, page)
 	}
 	jobID := hexUUID()
-	directory := s.jobDir(jobID)
-	if err := os.MkdirAll(filepath.Join(directory, "input"), 0o755); err != nil {
-		return nil, fail(apicode.Internal, "cannot create job")
-	}
+	ctx := context.Background()
 	for index, page := range prepared {
-		path := filepath.Join(directory, "input", strconv.Itoa(index)+".jpg")
-		if err := os.WriteFile(path, page, 0o644); err != nil {
+		if err := s.files.writeBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg", page); err != nil {
+			_ = s.files.remove(ctx, jobID)
 			return nil, fail(apicode.Internal, "cannot create job")
 		}
 	}
@@ -123,6 +143,7 @@ func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) 
 		ExpiresAt: now.Add(time.Duration(s.settings.RetentionHours) * time.Hour).Format(time.RFC3339Nano),
 	}
 	if err := s.write(job); err != nil {
+		_ = s.files.remove(ctx, jobID)
 		return nil, fail(apicode.Internal, "cannot create job")
 	}
 	return job, nil
@@ -183,19 +204,31 @@ func (s *Store) PDFFromUploads(uploads [][]byte) ([]byte, error) {
 	return data, nil
 }
 
+func (s *Store) Start(jobID string) {
+	if s.asyncStart != nil {
+		if err := s.asyncStart(jobID); err != nil {
+			log.Printf("async start job=%s: %v", jobID, err)
+			job, _ := s.read(jobID)
+			if job != nil {
+				s.markFailed(job, "model call failed")
+			}
+		}
+		return
+	}
+	go s.Run(jobID)
+}
+
 func (s *Store) Run(jobID string) {
+	ctx := context.Background()
 	job, err := s.read(jobID)
 	if err != nil || job == nil || job.Status != "pending" {
 		return
 	}
 	job.Status = "running"
 	_ = s.write(job)
-	directory := s.jobDir(jobID)
-	outputDir := filepath.Join(directory, "output")
-	_ = os.MkdirAll(outputDir, 0o755)
 	pages := make([][]byte, 0, job.PageCount)
 	for index := 0; index < job.PageCount; index++ {
-		source, err := os.ReadFile(filepath.Join(directory, "input", strconv.Itoa(index)+".jpg"))
+		source, err := s.files.readBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg")
 		if err != nil {
 			s.markFailed(job, "model call failed")
 			return
@@ -213,8 +246,7 @@ func (s *Store) Run(jobID string) {
 		pages = append(pages, edited)
 	}
 	for index, page := range pages {
-		path := filepath.Join(outputDir, strconv.Itoa(index)+".jpg")
-		if err := os.WriteFile(path, page, 0o644); err != nil {
+		if err := s.files.writeBlob(ctx, jobID, "output/"+strconv.Itoa(index)+".jpg", page); err != nil {
 			s.markFailed(job, "model call failed")
 			return
 		}
@@ -224,7 +256,7 @@ func (s *Store) Run(jobID string) {
 		s.markFailed(job, "model call failed")
 		return
 	}
-	if err := os.WriteFile(filepath.Join(directory, "result.pdf"), pdfBytes, 0o644); err != nil {
+	if err := s.files.writeBlob(ctx, jobID, "result.pdf", pdfBytes); err != nil {
 		s.markFailed(job, "model call failed")
 		return
 	}
@@ -255,7 +287,7 @@ func (s *Store) Preview(jobID string, index int) ([]byte, error) {
 	if index < 0 || index >= job.PageCount {
 		return nil, fail(apicode.PageNotFound, "")
 	}
-	data, err := os.ReadFile(filepath.Join(s.jobDir(jobID), "output", strconv.Itoa(index)+".jpg"))
+	data, err := s.files.readBlob(context.Background(), jobID, "output/"+strconv.Itoa(index)+".jpg")
 	if err != nil {
 		return nil, fail(apicode.PageNotFound, "")
 	}
@@ -270,7 +302,7 @@ func (s *Store) PDF(jobID string) ([]byte, error) {
 	if err := RequireReady(job); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(s.jobDir(jobID), "result.pdf"))
+	data, err := s.files.readBlob(context.Background(), jobID, "result.pdf")
 	if err != nil {
 		return nil, fail(apicode.JobNotReady, "")
 	}
@@ -278,24 +310,17 @@ func (s *Store) PDF(jobID string) ([]byte, error) {
 }
 
 func (s *Store) Delete(jobID string) {
-	_ = os.RemoveAll(s.jobDir(jobID))
+	_ = s.files.remove(context.Background(), jobID)
 }
 
 func (s *Store) Cleanup() {
-	entries, err := os.ReadDir(s.root)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			_ = s.deleteIfExpired(entry.Name())
-		}
+	for _, id := range s.files.listIDs(context.Background()) {
+		_ = s.deleteIfExpired(id)
 	}
 }
 
 func (s *Store) markFailed(job *Job, message string) {
-	_ = os.RemoveAll(filepath.Join(s.jobDir(job.ID), "output"))
-	_ = os.Remove(filepath.Join(s.jobDir(job.ID), "result.pdf"))
+	_ = s.files.removeBlobs(context.Background(), job.ID, "output/", "result.pdf")
 	job.Status = "failed"
 	job.Error = &message
 	s.refund(job)
@@ -351,42 +376,18 @@ func (s *Store) deleteIfExpired(jobID string) error {
 	return nil
 }
 
-func (s *Store) jobDir(jobID string) string {
-	return filepath.Join(s.root, jobID)
-}
-
 func (s *Store) write(job *Job) error {
 	if !jobIDPattern.MatchString(job.ID) {
 		return fail(apicode.JobNotFound, "")
 	}
-	payload, err := json.Marshal(job)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return os.WriteFile(filepath.Join(s.jobDir(job.ID), "meta.json"), payload, 0o644)
+	return s.files.writeMeta(context.Background(), job)
 }
 
 func (s *Store) read(jobID string) (*Job, error) {
 	if !jobIDPattern.MatchString(jobID) {
 		return nil, fail(apicode.JobNotFound, "")
 	}
-	path := filepath.Join(s.jobDir(jobID), "meta.json")
-	s.mu.Lock()
-	data, err := os.ReadFile(path)
-	s.mu.Unlock()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var job Job
-	if err := json.Unmarshal(data, &job); err != nil {
-		return nil, err
-	}
-	return &job, nil
+	return s.files.readMeta(context.Background(), jobID)
 }
 
 func hexUUID() string {

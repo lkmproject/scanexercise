@@ -5,6 +5,8 @@ backend/.venv
 backend/.pytest_cache
 backend/.env
 backend/data
+backend/bootstrap
+backend/function.zip
 mobile/node_modules
 mobile/.expo
 mobile/ios

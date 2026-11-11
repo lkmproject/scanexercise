@@ -60,7 +60,7 @@ API 金鑰只放在伺服器。客戶端不接觸模型。
 
 - 依 EXIF 轉正。
 - 統一編碼為 JPEG。
-- 長邊超過上限時等比縮小（預設 2048，控制上傳體積與延遲）。
+- 長邊超過上限時等比縮小（預設 2560），再存 JPEG quality 95，以保留印刷字清晰度。
 - 單張上傳圖對應一次模型呼叫。
 
 ### JSON 回傳
@@ -91,15 +91,15 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 
 | 方法 | 路徑 | 行為 |
 |---|---|---|
-| `POST` | `/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
-| `GET` | `/me` | 回傳目前帳號與剩餘清除次數 |
-| `POST` | `/jobs` | 以 `multipart/form-data` 上傳一張或多張頁面圖；可選欄位 `crop=0|1`（預設 `0`），建立工作並回傳工作編號與扣次後的 `remaining`。按頁預扣次數，次數不足回 `1401`；工作失敗退回 |
-| `GET` | `/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining` |
-| `GET` | `/jobs/{id}/preview` | 成功後回傳各頁結果圖 |
-| `GET` | `/jobs/{id}/pdf` | 成功後回傳 PDF |
-| `POST` | `/pdf` | 以目前頁面圖直接產生 PDF |
+| `POST` | `/scanexercise/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
+| `GET` | `/scanexercise/me` | 回傳目前帳號與剩餘清除次數 |
+| `POST` | `/scanexercise/jobs` | 以 `multipart/form-data` 上傳一張或多張頁面圖；可選欄位 `crop=0|1`（預設 `0`），建立工作並回傳工作編號與扣次後的 `remaining`。按頁預扣次數，次數不足回 `1401`；工作失敗退回 |
+| `GET` | `/scanexercise/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining` |
+| `GET` | `/scanexercise/jobs/{id}/preview` | 成功後回傳各頁結果圖 |
+| `GET` | `/scanexercise/jobs/{id}/pdf` | 成功後回傳 PDF |
+| `POST` | `/scanexercise/pdf` | 以目前頁面圖直接產生 PDF |
 
-`/me`、`/jobs` 與 `/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
+`/scanexercise/me`、`/scanexercise/jobs` 與 `/scanexercise/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
 
 ### PDF
 
@@ -109,7 +109,7 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 
 ### 檔案生命週期
 
-試卷可能含姓名、學號與分數。原圖、結果圖與 PDF 在工作完成並被下載，或超過保留時間後刪除。保留時間的預設值為 24 小時。伺服器記錄不寫入試卷影像內容。
+試卷可能含姓名、學號與分數。原圖、結果圖與 PDF 存在 S3 `scanexercise`（`jobs/{id}/...`），工作 meta 存在 DynamoDB `Jobs`（`pk=PROJECT#scanexercise#JOB#{id}`，`sk=META`）。完成並被下載，或超過保留時間後刪除。保留時間的預設值為 24 小時（DynamoDB TTL 與 S3 lifecycle）。伺服器記錄不寫入試卷影像內容。
 
 ## 7. App 行為
 
