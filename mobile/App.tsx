@@ -20,10 +20,11 @@ import { cacheDirectory, downloadAsync, readAsStringAsync } from 'expo-file-syst
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
 
-import { createJob, createPdf, failFromEnvelope, getJob, getMe, isUnauthorized, type Job } from './src/api';
+import { createJob, failFromEnvelope, getJob, getMe, isUnauthorized, type Job } from './src/api';
 import AuthModal from './src/AuthModal';
 import { API_BASE_URL, MAX_PAGES } from './src/config';
 import { uriBytes } from './src/fileBytes';
+import { writeExamPdf } from './src/pdf';
 import { fitForUpload } from './src/prepareImage';
 import { authHeaders, clearAccessToken, loadSession, notifyUnauthorized, saveCurrentSession, subscribeUnauthorized } from './src/session';
 import { copy, loadLocale, localeFromDevice, localizeApiMessage, LOCALES, saveLocale, type Locale } from './src/i18n';
@@ -170,6 +171,8 @@ export default function App() {
   dragRef.current = drag;
   const sheetsRef = useRef(sheets);
   sheetsRef.current = sheets;
+  const preparingIds = useRef(new Set<string>());
+  const fittedUri = useRef(new Map<string, { uri: string; bytes: number }>());
   const gridRef = useRef(null as View | null);
   const gridFrame = useRef({ x: 0, y: 0, width: 0, height: 0 });
   const { width: windowWidth } = useWindowDimensions();
@@ -249,12 +252,20 @@ export default function App() {
               if (!cancelled) {
                 setSheets((current) => {
                   const nextSheets = current.map((sheet) => ({ ...sheet }));
-                  let index = 0;
-                  for (let i = 0; i < nextSheets.length && index < uris.length; i += 1) {
-                    if (nextSheets[i].processed == null) {
-                      nextSheets[i] = { ...nextSheets[i], processed: uris[index] };
-                      index += 1;
+                  const pending: number[] = [];
+                  nextSheets.forEach((sheet, index) => {
+                    if (sheet.processed == null) {
+                      pending.push(index);
                     }
+                  });
+                  const paths = next.previews ?? [];
+                  for (let n = 0; n < uris.length && n < paths.length; n += 1) {
+                    const page = previewPage(paths[n]);
+                    const sheetIndex = page == null ? null : pending[page];
+                    if (sheetIndex == null) {
+                      continue;
+                    }
+                    nextSheets[sheetIndex] = { ...nextSheets[sheetIndex], processed: uris[n] };
                   }
                   return nextSheets;
                 });
@@ -312,20 +323,63 @@ export default function App() {
     };
   }, [phase, job?.id]);
 
-  async function addPages(uris: string[]) {
+  function addPages(uris: string[]) {
     setError(null);
-    const prepared = await Promise.all(uris.map((uri) => fitForUpload(uri)));
-    const extras: Sheet[] = [];
-    for (const original of prepared) {
-      extras.push({
-        id: nextSheetId(),
-        original,
-        processed: null,
-        bytes: await uriBytes(original),
-      });
-    }
-    setSheets((current) => [...current, ...extras].slice(0, MAX_PAGES));
     setTab('home');
+    const room = MAX_PAGES - sheetsRef.current.length;
+    const incoming = uris.slice(0, Math.max(room, 0));
+    if (incoming.length === 0) {
+      return;
+    }
+    const extras = incoming.map((uri) => {
+      const sheet = {
+        id: nextSheetId(),
+        original: uri,
+        processed: null,
+        bytes: 0,
+      };
+      preparingIds.current.add(sheet.id);
+      return sheet;
+    });
+    const next = [...sheetsRef.current, ...extras];
+    sheetsRef.current = next;
+    setSheets(next);
+    void fitAdded(extras);
+  }
+
+  async function fitAdded(extras: Sheet[]) {
+    await Promise.all(
+      extras.map(async (sheet) => {
+        try {
+          const prepared = await fitForUpload(sheet.original);
+          if (!preparingIds.current.has(sheet.id)) {
+            return;
+          }
+          const bytes = await uriBytes(prepared);
+          if (!preparingIds.current.has(sheet.id)) {
+            return;
+          }
+          fittedUri.current.set(sheet.id, { uri: prepared, bytes });
+          setSheets((list) =>
+            list.map((item) => (item.id === sheet.id ? { ...item, original: prepared, bytes } : item)),
+          );
+        } catch {
+          // The selected photo stays on screen even if shrinking it fails.
+        } finally {
+          preparingIds.current.delete(sheet.id);
+        }
+      }),
+    );
+  }
+
+  async function waitUntilFitted() {
+    while (preparingIds.current.size > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  }
+
+  function pageUri(sheet: Sheet): string {
+    return sheet.processed ?? fittedUri.current.get(sheet.id)?.uri ?? sheet.original;
   }
 
   function changeLocale(next: Locale) {
@@ -354,7 +408,7 @@ export default function App() {
         if (result.canceled || result.assets.length === 0) {
           return;
         }
-        await addPages(result.assets.map((asset) => asset.uri));
+        addPages(result.assets.map((asset) => asset.uri));
         room -= result.assets.length;
       }
     } catch (caught) {
@@ -373,25 +427,29 @@ export default function App() {
       mediaTypes: ['images'],
       allowsMultipleSelection: true,
       selectionLimit: MAX_PAGES - sheets.length,
-      quality: 0.97,
+      quality: 1,
       preferredAssetRepresentationMode:
-        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current,
     });
     if (!result.canceled) {
-      await addPages(result.assets.map((asset) => asset.uri));
+      addPages(result.assets.map((asset) => asset.uri));
     }
   }
 
   async function submit() {
-    const pending = sheets.filter((sheet) => sheet.processed == null).map((sheet) => sheet.original);
-    if (pending.length === 0) {
-      setError(sheets.length === 0 ? t.noPages : t.noNewPages);
+    const selected = sheetsRef.current.filter((sheet) => sheet.processed == null);
+    if (selected.length === 0) {
+      setError(sheetsRef.current.length === 0 ? t.noPages : t.noNewPages);
       return;
     }
     setError(null);
     setJob(null);
     setPhase('processing');
     try {
+      await waitUntilFitted();
+      const pending = sheetsRef.current
+        .filter((sheet) => sheet.processed == null)
+        .map((sheet) => fittedUri.current.get(sheet.id)?.uri ?? sheet.original);
       const created = await createJob(pending, crop, binarization);
       applyRemaining(created.remaining);
       setJob({
@@ -512,7 +570,8 @@ export default function App() {
   }
 
   async function sharePdf() {
-    const uris = sheets.map((sheet) => sheet.processed ?? sheet.original);
+    await waitUntilFitted();
+    const uris = sheetsRef.current.map((sheet) => pageUri(sheet));
     if (uris.length === 0) {
       setError(t.noPages);
       return;
@@ -526,7 +585,7 @@ export default function App() {
         return;
       }
       const destination = `${directory}exam.pdf`;
-      await createPdf(uris, destination);
+      await writeExamPdf(uris, destination);
       if (!(await Sharing.isAvailableAsync())) {
         setError(t.shareUnavailable);
         return;
@@ -547,6 +606,9 @@ export default function App() {
   }
 
   function reset() {
+    preparingIds.current.clear();
+    fittedUri.current.clear();
+    sheetsRef.current = [];
     setSheets([]);
     setJob(null);
     setError(null);
@@ -569,7 +631,13 @@ export default function App() {
   }
 
   function removeSheet(index: number) {
+    const removed = sheets[index];
+    if (removed != null) {
+      preparingIds.current.delete(removed.id);
+      fittedUri.current.delete(removed.id);
+    }
     const next = sheets.filter((_, item) => item !== index);
+    sheetsRef.current = next;
     setSheets(next);
     if (next.length === 0) {
       setPhase('editing');
@@ -1099,16 +1167,16 @@ export default function App() {
         animationType="fade"
         onRequestClose={closeReset}
       >
-        <View style={styles.confirmScrim}>
+        <View style={styles.helpScrim}>
           <Pressable style={styles.confirmDismiss} onPress={closeReset} />
-          <View style={styles.confirmCard}>
-            <Text style={styles.confirmTitle}>{t.againConfirm}</Text>
-            <Text style={styles.confirmCopy}>{t.againConfirmCopy}</Text>
-            <View style={styles.confirmRow}>
-              <Pressable style={styles.confirmCancel} onPress={closeReset}>
-                <Text style={styles.confirmCancelLabel}>{t.cancel}</Text>
+          <View style={styles.helpCard}>
+            <Text style={styles.helpTitle}>{t.againConfirm}</Text>
+            <Text style={styles.helpCopy}>{t.againConfirmCopy}</Text>
+            <View style={styles.helpActions}>
+              <Pressable style={styles.helpCancel} onPress={closeReset}>
+                <Text style={styles.helpCancelLabel}>{t.cancel}</Text>
               </Pressable>
-              <Pressable style={styles.confirmOk} onPress={applyReset}>
+              <Pressable style={styles.helpAction} onPress={applyReset}>
                 <Text style={styles.confirmOkLabel}>{t.confirm}</Text>
               </Pressable>
             </View>
@@ -1175,6 +1243,15 @@ export default function App() {
       />
     </View>
   );
+}
+
+function previewPage(path: string): number | null {
+  const matched = /\/preview\/(\d+)$/.exec(path);
+  if (matched == null) {
+    return null;
+  }
+  const page = Number(matched[1]);
+  return Number.isInteger(page) ? page : null;
 }
 
 async function loadPreviews(job: Job): Promise<string[]> {
@@ -2333,59 +2410,8 @@ const styles = StyleSheet.create({
     color: '#111111',
     fontWeight: '800',
   },
-  confirmScrim: {
-    flex: 1,
-    justifyContent: 'center',
-    backgroundColor: 'rgba(17, 17, 17, 0.45)',
-    paddingHorizontal: 28,
-  },
   confirmDismiss: {
     flex: 1,
-  },
-  confirmCard: {
-    backgroundColor: '#111111',
-    borderRadius: 28,
-    paddingHorizontal: 22,
-    paddingTop: 24,
-    paddingBottom: 20,
-  },
-  confirmTitle: {
-    color: '#FFFFFF',
-    fontSize: 26,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-  confirmCopy: {
-    marginTop: 10,
-    color: '#FFD600',
-    fontSize: 15,
-    fontWeight: '700',
-    textAlign: 'center',
-    lineHeight: 22,
-  },
-  confirmRow: {
-    marginTop: 20,
-    flexDirection: 'row',
-    gap: 12,
-  },
-  confirmCancel: {
-    flex: 1,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 18,
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  confirmCancelLabel: {
-    color: '#111111',
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  confirmOk: {
-    flex: 1,
-    backgroundColor: '#FFD600',
-    borderRadius: 18,
-    paddingVertical: 14,
-    alignItems: 'center',
   },
   helpScrim: {
     flex: 1,
@@ -2416,6 +2442,30 @@ const styles = StyleSheet.create({
   },
   helpClose: {
     marginTop: 20,
+    backgroundColor: '#FFD600',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  helpActions: {
+    marginTop: 20,
+    flexDirection: 'row',
+    gap: 12,
+  },
+  helpCancel: {
+    flex: 1,
+    backgroundColor: '#F4F4F4',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  helpCancelLabel: {
+    color: '#111111',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  helpAction: {
+    flex: 1,
     backgroundColor: '#FFD600',
     borderRadius: 18,
     paddingVertical: 14,

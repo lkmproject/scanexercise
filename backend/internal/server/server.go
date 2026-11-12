@@ -45,10 +45,8 @@ func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) *gin.En
 	authed.GET("/me", s.me)
 	authed.POST("/uploads", s.createUploads)
 	authed.POST("/jobs", s.createJob)
-	authed.POST("/pdf", s.createPDF)
 	authed.GET("/jobs/:id/preview/:index", s.getPreview)
 	authed.GET("/jobs/:id/preview", s.listPreviews)
-	authed.GET("/jobs/:id/pdf", s.getPDF)
 	authed.GET("/jobs/:id", s.getJob)
 	return engine
 }
@@ -224,17 +222,10 @@ func (s *Server) getJob(c *gin.Context) {
 		"error":        job.Error,
 		"remaining":    s.store.Remaining(c.Request.Context(), job.UserID),
 	}
-	readyPages := 0
-	if job.Status == "succeeded" {
-		readyPages = job.PageCount
-		body["pdf"] = "/jobs/" + job.ID + "/pdf"
-	} else if job.Status == "failed" {
-		readyPages = job.Completed
-	}
-	if readyPages > 0 {
-		previews := make([]string, readyPages)
-		for index := 0; index < readyPages; index++ {
-			previews[index] = "/jobs/" + job.ID + "/preview/" + strconv.Itoa(index)
+	if indexes := s.store.OutputIndexes(job); len(indexes) > 0 {
+		previews := make([]string, len(indexes))
+		for i, index := range indexes {
+			previews[i] = "/jobs/" + job.ID + "/preview/" + strconv.Itoa(index)
 		}
 		body["previews"] = previews
 	}
@@ -268,32 +259,6 @@ func (s *Server) getPreview(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "image/jpeg", data)
-}
-
-func (s *Server) createPDF(c *gin.Context) {
-	uploads, ok := readUploadedPages(c)
-	if !ok {
-		return
-	}
-	data, err := s.store.PDFFromUploads(uploads)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-	c.Header("Content-Disposition", `attachment; filename="exam.pdf"`)
-	c.Data(http.StatusOK, "application/pdf", data)
-}
-
-func (s *Server) getPDF(c *gin.Context) {
-	jobID := c.Param("id")
-	data, err := s.store.PDF(jobID)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-	s.store.Delete(jobID)
-	c.Header("Content-Disposition", `attachment; filename="exam.pdf"`)
-	c.Data(http.StatusOK, "application/pdf", data)
 }
 
 func (s *Server) loadJob(c *gin.Context, jobID string) (*jobs.Job, bool) {

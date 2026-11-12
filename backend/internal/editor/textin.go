@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -66,10 +68,12 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	query.Set("doc_direction", strconv.Itoa(t.DocDirection)) // 0 skip orientation
 	requestImage, err := preprocess.ForTextIn(jpeg)
 	if err != nil {
+		logTextInError(0, nil, nil, err)
 		return nil, Fail("cannot read image")
 	}
 	req, err := http.NewRequest(http.MethodPost, editURL+"?"+query.Encode(), bytes.NewReader(requestImage))
 	if err != nil {
+		logTextInError(0, nil, nil, err)
 		return nil, Fail("model call failed")
 	}
 	req.Header.Set("x-ti-app-id", t.AppID)
@@ -82,6 +86,7 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		logTextInError(0, nil, nil, err)
 		if isTimeout(err) {
 			return nil, Fail("model timed out")
 		}
@@ -89,25 +94,88 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		logTextInError(resp.StatusCode, resp.Header, errBody, nil)
 		return nil, Fail("model call failed")
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logTextInError(resp.StatusCode, resp.Header, nil, err)
 		return nil, Fail("model call failed")
 	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
+		logTextInError(resp.StatusCode, resp.Header, body, err)
 		return nil, Fail("model call failed")
 	}
 	raw, err := processedImage(payload)
 	if err != nil {
+		logTextInError(resp.StatusCode, resp.Header, body, err)
 		return nil, err
 	}
 	encoded, err := preprocess.ToJPEG(raw)
 	if err != nil {
+		logTextInError(resp.StatusCode, resp.Header, nil, err)
 		return nil, Fail("model returned no image")
 	}
 	return encoded, nil
+}
+
+func logTextInError(status int, header http.Header, body []byte, err error) {
+	payload := map[string]any{}
+	_ = json.Unmarshal(body, &payload)
+	requestID := jsonString(payload["x_request_id"])
+	if requestID == "" && header != nil {
+		requestID = header.Get("X-Request-Id")
+		if requestID == "" {
+			requestID = header.Get("x-request-id")
+		}
+	}
+	log.Printf(
+		"textin error status=%d code=%s message=%q request_id=%s duration=%s err=%v body=%s",
+		status,
+		jsonString(payload["code"]),
+		jsonString(payload["message"]),
+		requestID,
+		jsonString(payload["duration"]),
+		err,
+		textInLogBody(body),
+	)
+}
+
+func jsonString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func textInLogBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) == nil {
+		if result, ok := payload["result"].(map[string]any); ok {
+			if _, ok := result["image"]; ok {
+				result["image"] = "[redacted]"
+			}
+		}
+		if cleaned, err := json.Marshal(payload); err == nil {
+			body = cleaned
+		}
+	}
+	const max = 800
+	if len(body) > max {
+		return string(body[:max]) + "...(truncated)"
+	}
+	return string(body)
 }
 
 func processedImage(payload any) ([]byte, error) {

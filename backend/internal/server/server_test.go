@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,10 +24,12 @@ import (
 	"scanexercise/internal/config"
 	"scanexercise/internal/editor"
 	"scanexercise/internal/jobs"
+	"scanexercise/internal/preprocess"
 	appserver "scanexercise/internal/server"
 )
 
 type fakeEditor struct {
+	mu            sync.Mutex
 	results       [][]byte
 	err           error
 	calls         [][]byte
@@ -35,6 +38,8 @@ type fakeEditor struct {
 }
 
 func (f *fakeEditor) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, append([]byte(nil), jpegBytes...))
 	f.crops = append(f.crops, opts.Crop)
 	f.binarizations = append(f.binarizations, opts.Binarization)
@@ -50,12 +55,16 @@ func (f *fakeEditor) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error)
 }
 
 type failSecond struct {
+	mu    sync.Mutex
 	calls int
 }
 
 func (f *failSecond) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.calls == 1 {
+	call := f.calls
+	f.mu.Unlock()
+	if call == 1 {
 		return jpegColor(color.RGBA{G: 255, A: 255}, 20, 10), nil
 	}
 	return nil, editor.Fail("model timed out")
@@ -320,15 +329,24 @@ func TestPreprocessAppliesExifAndLimitsLongEdge(t *testing.T) {
 	}
 }
 
-func TestSuccessReturnsEditedPagesInOrderThenDeletesAfterPDF(t *testing.T) {
+type echoEditor struct{}
+
+func (echoEditor) Edit(jpeg []byte, _ editor.Options) ([]byte, error) {
+	return append([]byte(nil), jpeg...), nil
+}
+
+func TestSuccessReturnsEditedPagesInOrder(t *testing.T) {
 	first := jpegColor(color.RGBA{R: 255, A: 255}, 30, 20)
 	second := jpegColor(color.RGBA{B: 255, A: 255}, 30, 20)
-	edited := [][]byte{
-		jpegColor(color.RGBA{G: 255, A: 255}, 16, 16),
-		jpegColor(color.RGBA{R: 255, G: 255, A: 255}, 18, 12),
+	prepared0, err := preprocess.ForTextIn(first)
+	if err != nil {
+		t.Fatal(err)
 	}
-	ed := &fakeEditor{results: append([][]byte{}, edited...)}
-	ts, client := newClient(t, ed)
+	prepared1, err := preprocess.ForTextIn(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, client := newClient(t, echoEditor{})
 	resp := postPages(t, client, apiBase(ts), [][]byte{first, second})
 	jobID := decodeData(t, resp)["id"].(string)
 	body := wait(t, client, apiBase(ts), jobID)
@@ -341,37 +359,19 @@ func TestSuccessReturnsEditedPagesInOrderThenDeletesAfterPDF(t *testing.T) {
 	}
 	page0 := getBytes(t, client, apiBase(ts)+"/jobs/"+jobID+"/preview/0")
 	page1 := getBytes(t, client, apiBase(ts)+"/jobs/"+jobID+"/preview/1")
-	if !bytes.Equal(page0, edited[0]) || !bytes.Equal(page1, edited[1]) {
+	if !bytes.Equal(page0, prepared0) || !bytes.Equal(page1, prepared1) {
 		t.Fatal("preview mismatch")
 	}
-	if bytes.Contains(page0, first) {
-		t.Fatal("original leaked into preview")
+	if body["pdf"] != nil {
+		t.Fatalf("pdf %v", body["pdf"])
 	}
-	pdfResp, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/pdf")
+	still, err := client.Get(apiBase(ts) + "/jobs/" + jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pdfResp.Body.Close()
-	if pdfResp.StatusCode != http.StatusOK {
-		t.Fatalf("pdf status %d", pdfResp.StatusCode)
-	}
-	if !strings.HasPrefix(pdfResp.Header.Get("Content-Type"), "application/pdf") {
-		t.Fatalf("content-type %s", pdfResp.Header.Get("Content-Type"))
-	}
-	pdfBytes, _ := io.ReadAll(pdfResp.Body)
-	if bytes.Index(pdfBytes, edited[0]) >= bytes.Index(pdfBytes, edited[1]) {
-		t.Fatal("pdf page order")
-	}
-	missing, err := client.Get(apiBase(ts) + "/jobs/" + jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := decodeEnvelope(t, missing)
-	if missing.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 after pdf, got %d", missing.StatusCode)
-	}
-	if codeOf(payload) != int32(apicode.JobNotFound) {
-		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
+	stillPayload := decodeEnvelope(t, still)
+	if codeOf(stillPayload) != int32(apicode.OK) {
+		t.Fatalf("code %v reason %v", stillPayload["code"], stillPayload["reason"])
 	}
 }
 
@@ -395,17 +395,6 @@ func TestModelFailureDoesNotReturnTheOriginal(t *testing.T) {
 	}
 	if codeOf(previewPayload) != int32(apicode.PageNotFound) {
 		t.Fatalf("preview code %v", previewPayload["code"])
-	}
-	pdfResp, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/pdf")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pdfPayload := decodeEnvelope(t, pdfResp)
-	if pdfResp.StatusCode != http.StatusOK {
-		t.Fatalf("pdf status %d", pdfResp.StatusCode)
-	}
-	if codeOf(pdfPayload) != int32(apicode.JobFailed) {
-		t.Fatalf("pdf code %v", pdfPayload["code"])
 	}
 }
 
@@ -440,7 +429,11 @@ func TestSecondPageFailureKeepsEarlierPages(t *testing.T) {
 	if len(previews) != 1 || body["pdf"] != nil {
 		t.Fatalf("body %#v", body)
 	}
-	preview, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/preview/0")
+	path, _ := previews[0].(string)
+	if path != "/jobs/"+jobID+"/preview/0" && path != "/jobs/"+jobID+"/preview/1" {
+		t.Fatalf("preview %s", path)
+	}
+	preview, err := client.Get(apiBase(ts) + path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,13 +445,19 @@ func TestSecondPageFailureKeepsEarlierPages(t *testing.T) {
 	if preview.StatusCode != http.StatusOK || preview.Header.Get("Content-Type") != "image/jpeg" || !bytes.HasPrefix(image, []byte{0xFF, 0xD8}) {
 		t.Fatalf("preview status %d type %s", preview.StatusCode, preview.Header.Get("Content-Type"))
 	}
-	missing, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/preview/1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	missingPayload := decodeEnvelope(t, missing)
-	if codeOf(missingPayload) != int32(apicode.PageNotFound) {
-		t.Fatalf("missing preview %#v", missingPayload)
+	for _, index := range []int{0, 1, 2} {
+		candidate := "/jobs/" + jobID + "/preview/" + strconv.Itoa(index)
+		if candidate == path {
+			continue
+		}
+		missing, err := client.Get(apiBase(ts) + candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingPayload := decodeEnvelope(t, missing)
+		if codeOf(missingPayload) != int32(apicode.PageNotFound) {
+			t.Fatalf("missing preview %#v", missingPayload)
+		}
 	}
 }
 
@@ -593,45 +592,6 @@ func TestBinarizationFlagIsPassedToEditor(t *testing.T) {
 	}
 	if len(ed.binarizations) != 1 || ed.binarizations[0] != 1 {
 		t.Fatalf("editor binarization %#v", ed.binarizations)
-	}
-}
-
-func TestPDFFromUploads(t *testing.T) {
-	ts, client := newClient(t, &fakeEditor{})
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("pages", "page.jpg")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := part.Write(jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, apiBase(ts)+"/pdf", &body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d body %s", resp.StatusCode, data)
-	}
-	if resp.Header.Get("Content-Type") != "application/pdf" {
-		t.Fatalf("content type %s", resp.Header.Get("Content-Type"))
-	}
-	if !bytes.HasPrefix(data, []byte("%PDF")) {
-		t.Fatalf("not a pdf")
 	}
 }
 

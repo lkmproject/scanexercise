@@ -5,7 +5,8 @@ import { MAX_LONG_EDGE } from './config';
 
 export async function fitForUpload(uri: string): Promise<string> {
   const size = await imageSize(uri);
-  if (size != null && Math.max(size.width, size.height) <= MAX_LONG_EDGE) {
+  const jpeg = /\.jpe?g($|\?)/i.test(uri);
+  if (jpeg && size != null && Math.max(size.width, size.height) <= MAX_LONG_EDGE) {
     return uri;
   }
   const context = ImageManipulator.manipulate(uri, {

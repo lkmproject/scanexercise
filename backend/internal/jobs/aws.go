@@ -162,8 +162,6 @@ func (a *awsStore) writeBlob(ctx context.Context, jobID, rel string, data []byte
 	switch {
 	case strings.HasSuffix(rel, ".jpg"):
 		contentType = "image/jpeg"
-	case strings.HasSuffix(rel, ".pdf"):
-		contentType = "application/pdf"
 	}
 	_, err := a.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(a.bucket),

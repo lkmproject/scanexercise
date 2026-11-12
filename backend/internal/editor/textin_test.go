@@ -8,7 +8,9 @@ import (
 	"image/color"
 	"image/jpeg"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -147,6 +149,38 @@ func TestMissingCredentialsFailBeforeTheRequest(t *testing.T) {
 	emptySecret.Client = client
 	if _, err := emptySecret.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || !strings.Contains(err.Error(), "TEXTIN_SECRET_CODE") {
 		t.Fatalf("secret error: %v", err)
+	}
+}
+
+func TestTextInErrorIsLoggedWithoutSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	ed := editor.NewTextIn("app-id", "secret-code", 5)
+	ed.Client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]any{
+			"code":         40306,
+			"message":      "qps limit",
+			"x_request_id": "req-9",
+			"duration":     12,
+			"result":       map[string]any{"image": "secret-image-bytes"},
+		})
+		header := make(http.Header)
+		header.Set("X-Request-Id", "header-should-not-override")
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(body)), Header: header}, nil
+	})}
+	if _, err := ed.Edit(jpegBytes(8, 8), editor.Options{}); err == nil || err.Error() != "model call failed" {
+		t.Fatalf("err %v", err)
+	}
+	line := logs.String()
+	for _, part := range []string{"textin error", "status=200", "code=40306", "message=\"qps limit\"", "request_id=req-9", "duration=12", "[redacted]"} {
+		if !strings.Contains(line, part) {
+			t.Fatalf("log missing %s: %s", part, line)
+		}
+	}
+	if strings.Contains(line, "secret-code") || strings.Contains(line, "secret-image-bytes") || strings.Contains(line, "app-id") {
+		t.Fatalf("secret in log: %s", line)
 	}
 }
 

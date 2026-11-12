@@ -84,7 +84,6 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 | 1202 | JobNotReady | result not ready |
 | 1203 | JobFailed | model call failed |
 | 1204 | PageNotFound | page not found |
-| 1301 | PDFFailed | cannot create pdf |
 | 1401 | InsufficientCredits | not enough erases |
 | 1901 | Internal | internal error |
 
@@ -95,23 +94,22 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 | `POST` | `/scanexercise/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
 | `GET` | `/scanexercise/me` | 回傳目前帳號與剩餘清除次數 |
 | `POST` | `/scanexercise/uploads` | JSON `{ "count": n }` 回傳 `{ "files": [{ "key", "url" }] }`。先看剩餘次數，不足回 `1401` 且不發上傳網址。`url` 為 S3 預簽 PUT（15 分鐘、`Content-Type: image/jpeg`），`key` 形如 `uploads/{userId}/{batch}/{i}.jpg` |
-| `POST` | `/scanexercise/jobs` | JSON `{ "keys": [...], "crop": 0\|1, "binarization": 0\|1 }`，`keys` 必須是該使用者剛取得的 upload key；伺服器從 S3 讀圖、前處理後建立工作。仍接受 `multipart/form-data`（本機／測試）。回傳工作編號與扣次後的 `remaining`。按頁預扣，次數不足回 `1401`。某一頁清除失敗就停止，已成功的頁保留，只退還沒成功的頁 |
+| `POST` | `/scanexercise/jobs` | JSON `{ "keys": [...], "crop": 0\|1, "binarization": 0\|1 }`，`keys` 必須是該使用者剛取得的 upload key；伺服器從 S3 讀圖、前處理後建立工作。仍接受 `multipart/form-data`（本機／測試）。回傳工作編號與扣次後的 `remaining`。按頁預扣，次數不足回 `1401`。TextIn 每次同時最多 2 張。某一張失敗就不再送後面的張；同一批裡已經成功的頁保留。只退沒成功的頁 |
 | `GET` | `/scanexercise/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining`。`running` 超過 TextIn 逾時加 60 秒沒有心跳、或 `pending` 超過 13 分鐘，標成 `failed`（`model timed out`）並退次，避免 worker OOM 後前端無限輪詢 |
 | `GET` | `/scanexercise/jobs/{id}/preview` | 成功的頁回傳結果圖。工作失敗時仍可讀已完成的頁 |
-| `GET` | `/scanexercise/jobs/{id}/pdf` | 成功後回傳 PDF |
-| `POST` | `/scanexercise/pdf` | 以目前頁面圖直接產生 PDF |
 
-`/scanexercise/me`、`/scanexercise/uploads`、`/scanexercise/jobs` 與 `/scanexercise/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
+`/scanexercise/me`、`/scanexercise/uploads` 與 `/scanexercise/jobs` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`。
 
 ### PDF
 
-- 一頁結果圖成為 PDF 的一頁。
-- 頁面順序與上傳順序相同。
+- 一頁圖成為 PDF 的一頁。已清除的用結果圖，還沒清除的用原圖。
+- 頁面順序與畫面上的頁序相同。
+- App 在手機上組成 PDF 再交給系統分享，不把圖或 PDF 經 Lambda 傳回，因此不受 6MB 限制。
 - 不重新排版題目，不把圖轉成可搜尋文字。
 
 ### 檔案生命週期
 
-試卷可能含姓名、學號與分數。原圖、結果圖與 PDF 存在 S3 `scanexercise`（`jobs/{id}/...`），工作 meta 存在 DynamoDB `Jobs`（`pk=PROJECT#scanexercise#JOB#{id}`，`sk=META`）。完成並被下載，或超過保留時間後刪除。保留時間的預設值為 24 小時（DynamoDB TTL 與 S3 lifecycle）。伺服器記錄不寫入試卷影像內容。
+試卷可能含姓名、學號與分數。原圖與結果圖存在 S3 `scanexercise`（`jobs/{id}/...`），工作 meta 存在 DynamoDB `Jobs`（`pk=PROJECT#scanexercise#JOB#{id}`，`sk=META`）。超過保留時間後刪除。保留時間的預設值為 24 小時（DynamoDB TTL 與 S3 lifecycle）。伺服器不組 PDF，記錄也不寫入試卷影像內容。
 
 ## 7. App 行為
 
@@ -119,7 +117,7 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 - 上傳中顯示處理狀態，完成後顯示每一頁的預覽。
 - 點預覽可進全螢幕，並可返回列表。
 - 預覽不阻擋下載。使用者可在仍有殘留筆跡時下載 PDF。
-- PDF 經系統分享表輸出。
+- PDF 在手機上組成，經系統分享表輸出。
 - 無網路或工作失敗時顯示錯誤，並保留使用者手上的原圖。
 
 ## 8. 驗收

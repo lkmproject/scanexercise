@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,7 +18,6 @@ import (
 	"scanexercise/internal/apicode"
 	"scanexercise/internal/config"
 	"scanexercise/internal/editor"
-	"scanexercise/internal/pdf"
 	"scanexercise/internal/preprocess"
 )
 
@@ -353,31 +353,6 @@ func (s *Store) Remaining(ctx context.Context, userID string) int {
 	return remaining
 }
 
-func (s *Store) PDFFromUploads(uploads [][]byte) ([]byte, error) {
-	if len(uploads) == 0 {
-		return nil, fail(apicode.NoPages, "")
-	}
-	if len(uploads) > s.settings.MaxPages {
-		return nil, fail(apicode.TooManyPages, "at most "+strconv.Itoa(s.settings.MaxPages)+" pages")
-	}
-	prepared := make([][]byte, 0, len(uploads))
-	for _, upload := range uploads {
-		if len(upload) > s.settings.MaxUploadBytes {
-			return nil, fail(apicode.ImageTooLarge, "")
-		}
-		page, err := preprocess.PreparePage(upload, s.settings.MaxLongEdge)
-		if err != nil {
-			return nil, fail(apicode.InvalidImage, err.Error())
-		}
-		prepared = append(prepared, page)
-	}
-	data, err := pdf.Build(prepared)
-	if err != nil {
-		return nil, fail(apicode.PDFFailed, "")
-	}
-	return data, nil
-}
-
 func (s *Store) Start(jobID string) {
 	if s.asyncStart != nil {
 		if err := s.asyncStart(jobID); err != nil {
@@ -432,59 +407,127 @@ func (s *Store) RunContext(ctx context.Context, jobID string) {
 			return
 		}
 	}
-	pages := make([][]byte, 0, job.PageCount)
-	for index := 0; index < job.PageCount; index++ {
-		if err := ctx.Err(); err != nil {
+	s.erasePages(ctx, job)
+}
+
+const textInConcurrency = 2
+
+func (s *Store) erasePages(ctx context.Context, job *Job) {
+	var mu sync.Mutex
+	opts := editor.Options{Crop: job.Crop, Binarization: job.Binarization}
+	stopped := false
+	reason := ""
+	succeeded := 0
+
+	for start := 0; start < job.PageCount; start += textInConcurrency {
+		if ctx.Err() != nil {
+			job.Completed = succeeded
 			s.markFailed(job, "model timed out")
 			return
 		}
-		if !s.touch(job) || job.Status != "running" {
-			log.Printf("run abort job=%s status=%s", jobID, job.Status)
+		mu.Lock()
+		halt := stopped
+		open := !halt && s.touch(job) && job.Status == "running"
+		mu.Unlock()
+		if halt {
+			break
+		}
+		if !open {
+			log.Printf("run abort job=%s status=%s", job.ID, job.Status)
 			return
 		}
-		source, err := s.files.readBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg")
-		if err != nil {
-			s.markFailed(job, "model call failed")
-			return
+		end := start + textInConcurrency
+		if end > job.PageCount {
+			end = job.PageCount
 		}
-		edited, err := s.editor.Edit(source, editor.Options{Crop: job.Crop, Binarization: job.Binarization})
-		if err != nil {
-			message := "model call failed"
-			var edErr *editor.Error
-			if errors.As(err, &edErr) {
-				message = edErr.Message
-			}
-			s.markFailed(job, message)
-			return
+		var wg sync.WaitGroup
+		for index := start; index < end; index++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				message, ok := s.erasePage(ctx, job.ID, index, opts)
+				mu.Lock()
+				defer mu.Unlock()
+				if !ok {
+					stopped = true
+					if reason == "" {
+						reason = message
+					}
+					return
+				}
+				succeeded++
+				job.Completed = succeeded
+				if !s.touch(job) {
+					stopped = true
+				}
+			}(index)
 		}
-		if err := s.files.writeBlob(ctx, jobID, "output/"+strconv.Itoa(index)+".jpg", edited); err != nil {
-			s.markFailed(job, "model call failed")
-			return
+		wg.Wait()
+		mu.Lock()
+		halt = stopped
+		mu.Unlock()
+		if halt {
+			break
 		}
-		job.Completed = index + 1
-		if !s.touch(job) {
-			log.Printf("run abort job=%s status=%s", jobID, job.Status)
-			return
-		}
-		pages = append(pages, edited)
 	}
-	pdfBytes, err := pdf.Build(pages)
-	if err != nil {
-		s.markFailed(job, "model call failed")
-		return
-	}
-	if err := s.files.writeBlob(ctx, jobID, "result.pdf", pdfBytes); err != nil {
-		s.markFailed(job, "model call failed")
+
+	mu.Lock()
+	job.Completed = succeeded
+	halt := stopped
+	message := reason
+	mu.Unlock()
+	if halt {
+		if message == "" {
+			message = "model call failed"
+		}
+		s.markFailed(job, message)
 		return
 	}
 	if !s.syncOpen(job) {
-		log.Printf("run abort job=%s status=%s", jobID, job.Status)
+		log.Printf("run abort job=%s status=%s", job.ID, job.Status)
 		return
 	}
 	job.Status = "succeeded"
 	job.Error = nil
 	_ = s.write(job)
-	log.Printf("run done job=%s pages=%d", jobID, job.PageCount)
+	log.Printf("run done job=%s pages=%d", job.ID, job.PageCount)
+}
+
+func (s *Store) erasePage(ctx context.Context, jobID string, index int, opts editor.Options) (string, bool) {
+	if err := ctx.Err(); err != nil {
+		return "model timed out", false
+	}
+	source, err := s.files.readBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg")
+	if err != nil {
+		return "model call failed", false
+	}
+	edited, err := s.editor.Edit(source, opts)
+	if err != nil {
+		log.Printf("textin page job=%s index=%d err=%v", jobID, index, err)
+		message := "model call failed"
+		var edErr *editor.Error
+		if errors.As(err, &edErr) && edErr.Message != "" {
+			message = edErr.Message
+		}
+		return message, false
+	}
+	if err := s.files.writeBlob(ctx, jobID, "output/"+strconv.Itoa(index)+".jpg", edited); err != nil {
+		return "model call failed", false
+	}
+	return "", true
+}
+
+func (s *Store) OutputIndexes(job *Job) []int {
+	if job == nil || (job.Status != "succeeded" && job.Status != "failed") {
+		return nil
+	}
+	indexes := make([]int, 0, job.PageCount)
+	for index := 0; index < job.PageCount; index++ {
+		if _, err := s.files.readBlob(context.Background(), job.ID, "output/"+strconv.Itoa(index)+".jpg"); err == nil {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
 }
 
 func (s *Store) Get(jobID string) (*Job, error) {
@@ -563,36 +606,17 @@ func (s *Store) Preview(jobID string, index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	limit := 0
 	switch job.Status {
-	case "succeeded":
-		limit = job.PageCount
-	case "failed":
-		limit = job.Completed
+	case "succeeded", "failed":
 	default:
 		return nil, fail(apicode.JobNotReady, "")
 	}
-	if index < 0 || index >= limit {
+	if index < 0 || index >= job.PageCount {
 		return nil, fail(apicode.PageNotFound, "")
 	}
 	data, err := s.files.readBlob(context.Background(), jobID, "output/"+strconv.Itoa(index)+".jpg")
 	if err != nil {
 		return nil, fail(apicode.PageNotFound, "")
-	}
-	return data, nil
-}
-
-func (s *Store) PDF(jobID string) ([]byte, error) {
-	job, err := s.Get(jobID)
-	if err != nil {
-		return nil, err
-	}
-	if err := RequireReady(job); err != nil {
-		return nil, err
-	}
-	data, err := s.files.readBlob(context.Background(), jobID, "result.pdf")
-	if err != nil {
-		return nil, fail(apicode.JobNotReady, "")
 	}
 	return data, nil
 }
@@ -612,9 +636,7 @@ func (s *Store) markFailed(job *Job, message string) {
 		return
 	}
 	if job.Completed <= 0 {
-		_ = s.files.removeBlobs(context.Background(), job.ID, "output/", "result.pdf")
-	} else {
-		_ = s.files.removeBlobs(context.Background(), job.ID, "result.pdf")
+		_ = s.files.removeBlobs(context.Background(), job.ID, "output/")
 	}
 	job.Status = "failed"
 	job.Error = &message

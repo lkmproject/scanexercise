@@ -28,9 +28,6 @@ const (
 	JobFailed    Code = 1203
 	PageNotFound Code = 1204
 
-	// 13xx files
-	PDFFailed Code = 1301
-
 	// 14xx credits
 	InsufficientCredits Code = 1401
 
@@ -72,8 +69,6 @@ func (c Code) Reason() string {
 		return "model call failed"
 	case PageNotFound:
 		return "page not found"
-	case PDFFailed:
-		return "cannot create pdf"
 	case InsufficientCredits:
 		return "not enough erases"
 	default:
