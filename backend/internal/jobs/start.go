@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"log"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
@@ -20,11 +21,17 @@ func NewLambdaStarter(functionName string, cfg aws.Config) func(jobID string) er
 		if err != nil {
 			return err
 		}
+		log.Printf("async invoke job=%s fn=%s", jobID, functionName)
 		_, err = client.Invoke(context.Background(), &lambda.InvokeInput{
 			FunctionName:   aws.String(functionName),
 			InvocationType: types.InvocationTypeEvent,
 			Payload:        payload,
 		})
-		return err
+		if err != nil {
+			log.Printf("async invoke failed job=%s: %v", jobID, err)
+			return err
+		}
+		log.Printf("async invoke ok job=%s", jobID)
+		return nil
 	}
 }

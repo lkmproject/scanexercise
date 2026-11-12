@@ -26,7 +26,7 @@ func Load() Settings {
 		TextInAppID:          getenv("TEXTIN_APP_ID", ""),
 		TextInSecretCode:     getenv("TEXTIN_SECRET_CODE", ""),
 		DataDir:              getenv("DATA_DIR", "data"),
-		MaxPages:             getenvInt("MAX_PAGES", 20),
+		MaxPages:             getenvInt("MAX_PAGES", 10),
 		RetentionHours:       getenvInt("RETENTION_HOURS", 24),
 		MaxLongEdge:          getenvInt("MAX_LONG_EDGE", 2560),
 		TextInTimeoutSeconds: getenvInt("TEXTIN_TIMEOUT_SECONDS", 180),

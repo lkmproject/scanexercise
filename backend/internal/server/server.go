@@ -43,6 +43,7 @@ func New(store *jobs.Store, accounts *auth.Service, tokens *auth.Tokens) *gin.En
 	authed := root.Group("/")
 	authed.Use(s.requireAuth)
 	authed.GET("/me", s.me)
+	authed.POST("/uploads", s.createUploads)
 	authed.POST("/jobs", s.createJob)
 	authed.POST("/pdf", s.createPDF)
 	authed.GET("/jobs/:id/preview/:index", s.getPreview)
@@ -138,16 +139,58 @@ func (s *Server) me(c *gin.Context) {
 	writeOK(c, profile)
 }
 
-func (s *Server) createJob(c *gin.Context) {
-	uploads, ok := readUploadedPages(c)
-	if !ok {
+func (s *Server) createUploads(c *gin.Context) {
+	var body struct {
+		Count int `json:"count"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeFail(c, apicode.InvalidRequest, "unable to read upload request")
 		return
 	}
-	job, err := s.store.Create(uploads, parseCrop(c), c.GetString("userID"))
+	slots, err := s.store.CreateUploadSlots(c.Request.Context(), c.GetString("userID"), body.Count)
 	if err != nil {
 		writeStoreError(c, err)
 		return
 	}
+	writeOK(c, map[string]any{"files": slots})
+}
+
+func (s *Server) createJob(c *gin.Context) {
+	if strings.Contains(c.GetHeader("Content-Type"), "application/json") {
+		s.createJobFromKeys(c)
+		return
+	}
+	uploads, ok := readUploadedPages(c)
+	if !ok {
+		return
+	}
+	job, err := s.store.Create(uploads, parseFlag(c, "crop"), parseFlag(c, "binarization"), c.GetString("userID"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	s.commitJob(c, job)
+}
+
+func (s *Server) createJobFromKeys(c *gin.Context) {
+	var body struct {
+		Keys         []string `json:"keys"`
+		Crop         int      `json:"crop"`
+		Binarization int      `json:"binarization"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		writeFail(c, apicode.InvalidRequest, "unable to read job data")
+		return
+	}
+	job, err := s.store.CreateFromKeys(c.Request.Context(), body.Keys, body.Crop, body.Binarization, c.GetString("userID"))
+	if err != nil {
+		writeStoreError(c, err)
+		return
+	}
+	s.commitJob(c, job)
+}
+
+func (s *Server) commitJob(c *gin.Context, job *jobs.Job) {
 	if err := s.store.Charge(c.Request.Context(), job); err != nil {
 		s.store.Delete(job.ID)
 		if errors.Is(err, auth.ErrInsufficient) {
@@ -158,6 +201,7 @@ func (s *Server) createJob(c *gin.Context) {
 		writeFail(c, apicode.Internal, "")
 		return
 	}
+	log.Printf("jobs start id=%s pages=%d", job.ID, job.PageCount)
 	s.store.Start(job.ID)
 	writeOK(c, map[string]any{
 		"id":        job.ID,
@@ -172,20 +216,27 @@ func (s *Server) getJob(c *gin.Context) {
 		return
 	}
 	body := map[string]any{
-		"id":         job.ID,
-		"status":     job.Status,
-		"page_count": job.PageCount,
-		"crop":       job.Crop,
-		"error":      job.Error,
-		"remaining":  s.store.Remaining(c.Request.Context(), job.UserID),
+		"id":           job.ID,
+		"status":       job.Status,
+		"page_count":   job.PageCount,
+		"crop":         job.Crop,
+		"binarization": job.Binarization,
+		"error":        job.Error,
+		"remaining":    s.store.Remaining(c.Request.Context(), job.UserID),
 	}
+	readyPages := 0
 	if job.Status == "succeeded" {
-		previews := make([]string, job.PageCount)
-		for index := 0; index < job.PageCount; index++ {
+		readyPages = job.PageCount
+		body["pdf"] = "/jobs/" + job.ID + "/pdf"
+	} else if job.Status == "failed" {
+		readyPages = job.Completed
+	}
+	if readyPages > 0 {
+		previews := make([]string, readyPages)
+		for index := 0; index < readyPages; index++ {
 			previews[index] = "/jobs/" + job.ID + "/preview/" + strconv.Itoa(index)
 		}
 		body["previews"] = previews
-		body["pdf"] = "/jobs/" + job.ID + "/pdf"
 	}
 	writeOK(c, body)
 }
@@ -325,10 +376,10 @@ func readUploadedPages(c *gin.Context) ([][]byte, bool) {
 	return uploads, true
 }
 
-func parseCrop(c *gin.Context) int {
-	raw := c.PostForm("crop")
+func parseFlag(c *gin.Context, name string) int {
+	raw := c.PostForm(name)
 	if raw == "" {
-		raw = c.Query("crop")
+		raw = c.Query(name)
 	}
 	switch raw {
 	case "1", "true", "on":

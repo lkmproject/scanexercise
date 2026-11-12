@@ -26,7 +26,7 @@
 ## 3. 使用流程
 
 1. 使用者在 App 內啟動文件掃描，或從相簿選擇試卷圖片。
-2. 客戶端先做紙張偵測、透視校正與裁切，再上傳。
+2. 客戶端先做紙張偵測、透視校正與裁切；長邊超過 1920 時縮到 1920、JPEG 質量 97，再上傳。
 3. 伺服器校正方向、轉成 JPEG，並把長邊縮到模型可接受的大小。
 4. 伺服器將圖送交 TextIn 手寫擦除，只採用回傳的圖像。
 5. App 顯示處理後的預覽。使用者可下載 PDF。
@@ -39,7 +39,7 @@
 擦除由 TextIn `handwritten_erase` 完成，不使用可覆寫的客戶端 prompt。
 
 - 認證：`TEXTIN_APP_ID`、`TEXTIN_SECRET_CODE`（請求頭 `x-ti-app-id`、`x-ti-secret-code`）。
-- 請求：JPEG 二進位；`crop` 由工作決定（`0` 關閉切邊，`1` 執行切邊），`dewarp=0`、`binarization=0`、`doc_direction=0`（不彎曲矯正、不增強銳化），`image_type=1` 回彩色圖。
+- 請求：JPEG 二進位；`crop` 由工作決定（`0` 關閉切邊，`1` 執行切邊），`binarization` 由工作決定（`0` 關閉增強銳化，`1` 執行），`dewarp=0`、`doc_direction=0`（不彎曲矯正、不轉正），`image_type=1` 回彩色圖。
 - 回應：只採用 `result.image` 圖像。
 
 API 金鑰只放在伺服器。客戶端不接觸模型。
@@ -58,9 +58,10 @@ API 金鑰只放在伺服器。客戶端不接觸模型。
 
 ### 前處理
 
-- 依 EXIF 轉正。
-- 統一編碼為 JPEG。
-- 長邊超過上限時等比縮小（預設 2560），再存 JPEG quality 95，以保留印刷字清晰度。
+- 依 EXIF 轉正，統一編碼為 JPEG。
+- 只縮一次給 TextIn：長邊 1920、JPEG quality 95；仍超過約 3MB 再降質，最低 70。預覽／PDF 用同一張圖，不再先存 2560 再縮。
+- TextIn 回圖若已是 JPEG 且長邊 ≤ 1920 則原樣留下；超過 1920 才縮，非 JPEG 才轉成 JPEG quality 99。
+- 單張上傳圖超過 20MB 回 `1105`。
 - 單張上傳圖對應一次模型呼叫。
 
 ### JSON 回傳
@@ -93,13 +94,14 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 |---|---|---|
 | `POST` | `/scanexercise/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
 | `GET` | `/scanexercise/me` | 回傳目前帳號與剩餘清除次數 |
-| `POST` | `/scanexercise/jobs` | 以 `multipart/form-data` 上傳一張或多張頁面圖；可選欄位 `crop=0|1`（預設 `0`），建立工作並回傳工作編號與扣次後的 `remaining`。按頁預扣次數，次數不足回 `1401`；工作失敗退回 |
-| `GET` | `/scanexercise/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining` |
-| `GET` | `/scanexercise/jobs/{id}/preview` | 成功後回傳各頁結果圖 |
+| `POST` | `/scanexercise/uploads` | JSON `{ "count": n }` 回傳 `{ "files": [{ "key", "url" }] }`。先看剩餘次數，不足回 `1401` 且不發上傳網址。`url` 為 S3 預簽 PUT（15 分鐘、`Content-Type: image/jpeg`），`key` 形如 `uploads/{userId}/{batch}/{i}.jpg` |
+| `POST` | `/scanexercise/jobs` | JSON `{ "keys": [...], "crop": 0\|1, "binarization": 0\|1 }`，`keys` 必須是該使用者剛取得的 upload key；伺服器從 S3 讀圖、前處理後建立工作。仍接受 `multipart/form-data`（本機／測試）。回傳工作編號與扣次後的 `remaining`。按頁預扣，次數不足回 `1401`。某一頁清除失敗就停止，已成功的頁保留，只退還沒成功的頁 |
+| `GET` | `/scanexercise/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining`。`running` 超過 TextIn 逾時加 60 秒沒有心跳、或 `pending` 超過 13 分鐘，標成 `failed`（`model timed out`）並退次，避免 worker OOM 後前端無限輪詢 |
+| `GET` | `/scanexercise/jobs/{id}/preview` | 成功的頁回傳結果圖。工作失敗時仍可讀已完成的頁 |
 | `GET` | `/scanexercise/jobs/{id}/pdf` | 成功後回傳 PDF |
 | `POST` | `/scanexercise/pdf` | 以目前頁面圖直接產生 PDF |
 
-`/scanexercise/me`、`/scanexercise/jobs` 與 `/scanexercise/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
+`/scanexercise/me`、`/scanexercise/uploads`、`/scanexercise/jobs` 與 `/scanexercise/pdf` 需 `Authorization: Bearer <token>`。狀態為 `failed` 時回傳可顯示的錯誤，例如模型拒絕、逾時或輸出中沒有圖像。不把「仍有手寫殘留」標成失敗。`GET /jobs/{id}` 成功取得失敗工作時，外層 `code` 仍是 200，失敗寫在 `data.status` / `data.error`。清除按頁計費，餘額存在 DynamoDB `Users` 的 `USER#<id>` / `BALANCE`；`POST /pdf` 不扣次。
 
 ### PDF
 
@@ -141,4 +143,4 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 
 - 服務在中國大陸公有雲處理影像。
 - 極端重疊、極淡鉛筆或複雜塗改仍可能殘留。
-- 單頁按次計費。一次工作的頁數應設上限，預設 20 頁。
+- 單頁按次計費。一次工作的頁數應設上限，預設 10 頁。

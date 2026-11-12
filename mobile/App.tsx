@@ -16,7 +16,6 @@ import {
   type ViewToken,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { scanDocument } from 'expo-document-scanner';
 import { cacheDirectory, downloadAsync, readAsStringAsync } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
@@ -24,8 +23,10 @@ import * as Sharing from 'expo-sharing';
 import { createJob, createPdf, failFromEnvelope, getJob, getMe, isUnauthorized, type Job } from './src/api';
 import AuthModal from './src/AuthModal';
 import { API_BASE_URL, MAX_PAGES } from './src/config';
-import { authHeaders, clearAccessToken, notifyUnauthorized, subscribeUnauthorized } from './src/session';
-import { copy, loadLocale, localeFromDevice, LOCALES, saveLocale, type Locale } from './src/i18n';
+import { uriBytes } from './src/fileBytes';
+import { fitForUpload } from './src/prepareImage';
+import { authHeaders, clearAccessToken, loadSession, notifyUnauthorized, saveCurrentSession, subscribeUnauthorized } from './src/session';
+import { copy, loadLocale, localeFromDevice, localizeApiMessage, LOCALES, saveLocale, type Locale } from './src/i18n';
 
 type Phase = 'editing' | 'processing' | 'done';
 type Tab = 'home' | 'me';
@@ -34,6 +35,7 @@ type Sheet = {
   id: string;
   original: string;
   processed: string | null;
+  bytes: number;
 };
 
 type DragState = {
@@ -86,6 +88,61 @@ function moveItem<T>(list: T[], from: number, to: number): T[] {
   return next;
 }
 
+function FlagSwitch({
+  label,
+  value,
+  disabled,
+  onToggle,
+  onHelp,
+  helpLabel,
+  hintDark,
+  rowStyle,
+  labelStyle,
+}: {
+  label: string;
+  value: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+  onHelp?: () => void;
+  helpLabel?: string;
+  hintDark?: boolean;
+  rowStyle: object;
+  labelStyle: object;
+}) {
+  return (
+    <View style={rowStyle}>
+      <View style={styles.flagLabelRow}>
+        {onHelp ? (
+          <Pressable
+            onPress={onHelp}
+            hitSlop={6}
+            accessibilityRole="button"
+            accessibilityLabel={helpLabel ?? label}
+          >
+            <View style={[styles.helpDot, hintDark ? styles.helpDotDark : null]}>
+              <Text style={[styles.helpMark, hintDark ? styles.helpMarkDark : null]}>?</Text>
+            </View>
+          </Pressable>
+        ) : null}
+        <Text style={labelStyle}>{label}</Text>
+      </View>
+      <Pressable
+        disabled={disabled}
+        onPress={onToggle}
+        hitSlop={8}
+        accessibilityRole="switch"
+        accessibilityState={{ checked: value }}
+        accessibilityLabel={label}
+        style={styles.flagSwitch}
+      >
+        <View style={[styles.switchTrack, value ? styles.switchOn : null]}>
+          <View style={[styles.switchThumb, value ? styles.switchThumbOn : null]} />
+        </View>
+      </Pressable>
+    </View>
+  );
+}
+
 export default function App() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
   const [phase, setPhase] = useState<Phase>('editing');
@@ -94,7 +151,9 @@ export default function App() {
   const [sharing, setSharing] = useState(false);
   const [selectedPage, setSelectedPage] = useState<{ uri: string; index: number } | null>(null);
   const [tab, setTab] = useState<Tab>('home');
-  const [crop, setCrop] = useState(false);
+  const [crop, setCrop] = useState(true);
+  const [binarization, setBinarization] = useState(true);
+  const [optionHelp, setOptionHelp] = useState<{ title: string; copy: string } | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [locale, setLocale] = useState<Locale>(localeFromDevice);
@@ -120,7 +179,34 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    return subscribeUnauthorized(openLogin);
+    const unsubscribe = subscribeUnauthorized(openLogin);
+    void loadSession().then(async (session) => {
+      if (session == null) {
+        return;
+      }
+      setSignedIn(true);
+      setAccount({
+        ...FAKE_ACCOUNT,
+        name: session.name,
+        email: session.email,
+        remaining: session.remaining ?? 0,
+        provider: session.provider,
+      });
+      try {
+        const me = await getMe();
+        setAccount((current) => ({
+          ...current,
+          name: me.name,
+          email: me.email,
+          remaining: me.remaining,
+        }));
+      } catch (error) {
+        if (!isUnauthorized(error)) {
+          return;
+        }
+      }
+    });
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -137,8 +223,17 @@ export default function App() {
     let cancelled = false;
     let settled = false;
     let failures = 0;
+    const startedAt = Date.now();
 
     const tick = () => {
+      if (Date.now() - startedAt > 10 * 60 * 1000) {
+        if (!settled) {
+          settled = true;
+          setError(tRef.current.clearingTimeout);
+          setPhase('editing');
+        }
+        return;
+      }
       void getJob(job.id)
         .then(async (next) => {
           if (cancelled || settled) {
@@ -146,7 +241,8 @@ export default function App() {
           }
           failures = 0;
           applyRemaining(next.remaining);
-          if (next.status === 'succeeded') {
+          const partial = next.status === 'failed' && (next.previews?.length ?? 0) > 0;
+          if (next.status === 'succeeded' || partial) {
             settled = true;
             try {
               const uris = await loadPreviews(next);
@@ -162,7 +258,13 @@ export default function App() {
                   }
                   return nextSheets;
                 });
-                setPhase('done');
+                if (partial) {
+                  const raw = next.error ?? 'model call failed';
+                  setError(localizeApiMessage(tRef.current, raw));
+                  setPhase('editing');
+                } else {
+                  setPhase('done');
+                }
               }
             } catch (error) {
               if (cancelled) {
@@ -179,7 +281,8 @@ export default function App() {
           }
           if (next.status === 'failed') {
             settled = true;
-            setError(next.error ?? tRef.current.modelFailed);
+            const raw = next.error ?? 'model call failed';
+            setError(localizeApiMessage(tRef.current, raw));
             setPhase('editing');
           }
         })
@@ -202,21 +305,26 @@ export default function App() {
     };
 
     tick();
-    const timer = setInterval(tick, 1500);
+    const timer = setInterval(tick, 2000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [phase, job]);
+  }, [phase, job?.id]);
 
-  function addPages(uris: string[]) {
+  async function addPages(uris: string[]) {
     setError(null);
-    setSheets((current) =>
-      [
-        ...current,
-        ...uris.map((original) => ({ id: nextSheetId(), original, processed: null })),
-      ].slice(0, MAX_PAGES),
-    );
+    const prepared = await Promise.all(uris.map((uri) => fitForUpload(uri)));
+    const extras: Sheet[] = [];
+    for (const original of prepared) {
+      extras.push({
+        id: nextSheetId(),
+        original,
+        processed: null,
+        bytes: await uriBytes(original),
+      });
+    }
+    setSheets((current) => [...current, ...extras].slice(0, MAX_PAGES));
     setTab('home');
   }
 
@@ -230,13 +338,25 @@ export default function App() {
       setError(t.tooManyPages(MAX_PAGES));
       return;
     }
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      setError(t.cameraDenied);
+      return;
+    }
+    let room = MAX_PAGES - sheets.length;
     try {
-      const result = await scanDocument({
-        quality: 0.95,
-        maxNumDocuments: MAX_PAGES - sheets.length,
-        galleryImportAllowed: true,
-      });
-      addPages(result.pages.map((page) => page.uri));
+      while (room > 0) {
+        const result = await ImagePicker.launchCameraAsync({
+          mediaTypes: ['images'],
+          quality: 0.97,
+          allowsEditing: false,
+        });
+        if (result.canceled || result.assets.length === 0) {
+          return;
+        }
+        await addPages(result.assets.map((asset) => asset.uri));
+        room -= result.assets.length;
+      }
     } catch (caught) {
       if (!isCancel(caught)) {
         setError(caught instanceof Error ? caught.message : t.scanFailed);
@@ -253,12 +373,12 @@ export default function App() {
       mediaTypes: ['images'],
       allowsMultipleSelection: true,
       selectionLimit: MAX_PAGES - sheets.length,
-      quality: 0.95,
+      quality: 0.97,
       preferredAssetRepresentationMode:
         ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
     });
     if (!result.canceled) {
-      addPages(result.assets.map((asset) => asset.uri));
+      await addPages(result.assets.map((asset) => asset.uri));
     }
   }
 
@@ -269,8 +389,10 @@ export default function App() {
       return;
     }
     setError(null);
+    setJob(null);
+    setPhase('processing');
     try {
-      const created = await createJob(pending, crop);
+      const created = await createJob(pending, crop, binarization);
       applyRemaining(created.remaining);
       setJob({
         id: created.id,
@@ -279,14 +401,13 @@ export default function App() {
         error: null,
         remaining: created.remaining,
       });
-      setPhase('processing');
     } catch (caught) {
       if (isUnauthorized(caught)) {
         openLogin();
         return;
       }
-      const message = caught instanceof Error ? caught.message : t.serverFailed;
-      setError(message === 'not enough erases' ? t.notEnoughErases : message);
+      const message = caught instanceof Error ? localizeApiMessage(t, caught.message) : t.serverFailed;
+      setError(message);
       setPhase('editing');
     }
   }
@@ -354,6 +475,14 @@ export default function App() {
           },
     );
     setAuthOpen(false);
+    if (next != null) {
+      saveCurrentSession({
+        name: next.name,
+        email: next.email,
+        remaining: next.remaining,
+        provider: next.provider,
+      });
+    }
     const action = pendingAuth.current;
     pendingAuth.current = null;
     if (action === 'me') {
@@ -411,7 +540,7 @@ export default function App() {
         openLogin();
         return;
       }
-      setError(caught instanceof Error ? caught.message : t.pdfFailed);
+      setError(caught instanceof Error ? localizeApiMessage(t, caught.message) : t.pdfFailed);
     } finally {
       setSharing(false);
     }
@@ -491,6 +620,8 @@ export default function App() {
   const busy = phase === 'processing';
   const processedCount = sheets.filter((sheet) => sheet.processed != null).length;
   const pendingCount = sheets.length - processedCount;
+  const totalBytes = sheets.reduce((sum, sheet) => sum + sheet.bytes, 0);
+  const totalKb = Math.max(0, Math.round(totalBytes / 1024));
   const shownPages = sheets.map((sheet) => sheet.processed ?? sheet.original);
   const showBanner = tab === 'home' && phase !== 'processing' && processedCount === 0;
   const showResult = tab === 'home' && processedCount > 0 && phase !== 'processing';
@@ -529,6 +660,27 @@ export default function App() {
       <View style={styles.blobYellow} />
       <View style={styles.blobPink} />
       <View style={styles.blobPeach} />
+
+      {error != null && tab === 'home' ? (
+        <View style={styles.errorBanner}>
+          <View style={styles.errorBannerCopy}>
+            <Text style={styles.errorBannerText}>{error}</Text>
+            {job ? (
+              <Text selectable style={styles.errorBannerJob}>
+                {t.jobId(job.id)}
+              </Text>
+            ) : null}
+          </View>
+          <Pressable
+            onPress={() => setError(null)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={t.close}
+          >
+            <Text style={styles.errorBannerClose}>×</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       <ScrollView
         contentContainerStyle={styles.bodyScroll}
@@ -601,21 +753,28 @@ export default function App() {
                   <Pressable style={styles.resultPrimary} disabled={busy} onPress={() => requestAuth('erase')}>
                     <Text style={styles.resultPrimaryLabel}>{t.eraseNew}</Text>
                   </Pressable>
-                  <View style={styles.resultCropRow}>
-                    <Text style={styles.resultCropLabel}>{t.crop}</Text>
-                    <Pressable
-                      disabled={busy}
-                      onPress={() => setCrop((current) => !current)}
-                      hitSlop={8}
-                      accessibilityRole="switch"
-                      accessibilityState={{ checked: crop }}
-                      accessibilityLabel={t.crop}
-                    >
-                      <View style={[styles.switchTrack, crop ? styles.switchOn : null]}>
-                        <View style={[styles.switchThumb, crop ? styles.switchThumbOn : null]} />
-                      </View>
-                    </Pressable>
-                  </View>
+                  <FlagSwitch
+                    label={t.crop}
+                    value={crop}
+                    disabled={busy}
+                    onToggle={() => setCrop((current) => !current)}
+                    onHelp={() => setOptionHelp({ title: t.cropHelpTitle, copy: t.cropHelp })}
+                    helpLabel={t.cropHelpTitle}
+                    hintDark
+                    rowStyle={styles.resultCropRow}
+                    labelStyle={styles.resultCropLabel}
+                  />
+                  <FlagSwitch
+                    label={t.binarization}
+                    value={binarization}
+                    disabled={busy}
+                    onToggle={() => setBinarization((current) => !current)}
+                    onHelp={() => setOptionHelp({ title: t.binarizationHelpTitle, copy: t.binarizationHelp })}
+                    helpLabel={t.binarizationHelpTitle}
+                    hintDark
+                    rowStyle={styles.resultCropRow}
+                    labelStyle={styles.resultCropLabel}
+                  />
                 </>
               ) : (
                 <Pressable
@@ -672,34 +831,39 @@ export default function App() {
                   </View>
                 </Pressable>
                 <View style={[styles.tile, pendingCount === 0 || busy ? styles.tileDisabled : null]}>
-                  <View>
-                    <Pressable disabled={busy} onPress={() => requestAuth('erase')}>
+                  <View style={styles.tileHead}>
+                    <Pressable disabled={busy} onPress={() => requestAuth('erase')} style={styles.tileHeadCopy}>
                       <Text style={styles.tileTitle}>{t.erase}</Text>
                       <Text style={styles.tileCopy}>{processedCount > 0 ? t.eraseNew : t.keepPrint}</Text>
                     </Pressable>
-                    <View style={styles.cropRow}>
-                      <Text style={styles.cropLabel}>{t.crop}</Text>
-                      <Pressable
-                        disabled={busy}
-                        onPress={() => setCrop((current) => !current)}
-                        hitSlop={8}
-                        accessibilityRole="switch"
-                        accessibilityState={{ checked: crop }}
-                        accessibilityLabel={t.crop}
-                      >
-                        <View style={[styles.switchTrack, crop ? styles.switchOn : null]}>
-                          <View style={[styles.switchThumb, crop ? styles.switchThumbOn : null]} />
-                        </View>
-                      </Pressable>
-                    </View>
+                    <Pressable
+                      style={[styles.iconBtn, styles.pillPurple, styles.tileHeadAction]}
+                      disabled={busy}
+                      onPress={() => requestAuth('erase')}
+                    >
+                      <View style={styles.play} />
+                    </Pressable>
                   </View>
-                  <Pressable
-                    style={[styles.iconBtn, styles.pillPurple]}
+                  <FlagSwitch
+                    label={t.crop}
+                    value={crop}
                     disabled={busy}
-                    onPress={() => requestAuth('erase')}
-                  >
-                    <View style={styles.play} />
-                  </Pressable>
+                    onToggle={() => setCrop((current) => !current)}
+                    onHelp={() => setOptionHelp({ title: t.cropHelpTitle, copy: t.cropHelp })}
+                    helpLabel={t.cropHelpTitle}
+                    rowStyle={styles.cropRow}
+                    labelStyle={styles.cropLabel}
+                  />
+                  <FlagSwitch
+                    label={t.binarization}
+                    value={binarization}
+                    disabled={busy}
+                    onToggle={() => setBinarization((current) => !current)}
+                    onHelp={() => setOptionHelp({ title: t.binarizationHelpTitle, copy: t.binarizationHelp })}
+                    helpLabel={t.binarizationHelpTitle}
+                    rowStyle={styles.cropRow}
+                    labelStyle={styles.cropLabel}
+                  />
                 </View>
             </View>
           </View>
@@ -786,6 +950,10 @@ export default function App() {
                 <Text style={styles.empty}>{t.empty}</Text>
               ) : null}
 
+              {shownPages.length > 0 && totalKb > 0 ? (
+                <Text style={styles.pageSize}>{t.totalSize(totalKb)}</Text>
+              ) : null}
+
               {shownPages.length > 0 ? (
                 <View
                   ref={gridRef}
@@ -857,16 +1025,22 @@ export default function App() {
               ) : null}
 
               {phase === 'processing' ? (
-                <View style={styles.statusRow}>
-                  <ActivityIndicator color="#111111" />
-                  <Text style={styles.status}>{t.clearing}</Text>
+                <View>
+                  <View style={styles.statusRow}>
+                    <ActivityIndicator color="#111111" />
+                    <Text style={styles.status}>{t.clearing}</Text>
+                  </View>
+                  {job ? (
+                    <Text selectable style={styles.jobId}>
+                      {t.jobId(job.id)}
+                    </Text>
+                  ) : null}
                 </View>
               ) : null}
 
             </>
           )}
 
-          {error ? <Text style={styles.error}>{error}</Text> : null}
         </View>
       </ScrollView>
 
@@ -940,6 +1114,25 @@ export default function App() {
             </View>
           </View>
           <Pressable style={styles.confirmDismiss} onPress={closeReset} />
+        </View>
+      </Modal>
+
+      <Modal
+        visible={optionHelp != null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setOptionHelp(null)}
+      >
+        <View style={styles.helpScrim}>
+          <Pressable style={styles.confirmDismiss} onPress={() => setOptionHelp(null)} />
+          <View style={styles.helpCard}>
+            <Text style={styles.helpTitle}>{optionHelp?.title}</Text>
+            <Text style={styles.helpCopy}>{optionHelp?.copy}</Text>
+            <Pressable style={styles.helpClose} onPress={() => setOptionHelp(null)}>
+              <Text style={styles.confirmOkLabel}>{t.aboutClose}</Text>
+            </Pressable>
+          </View>
+          <Pressable style={styles.confirmDismiss} onPress={() => setOptionHelp(null)} />
         </View>
       </Modal>
 
@@ -1518,11 +1711,54 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6E6E6E',
   },
+  tileHead: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  tileHeadCopy: {
+    flex: 1,
+  },
+  tileHeadAction: {
+    marginTop: 0,
+  },
   cropRow: {
     marginTop: 14,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 10,
+  },
+  flagLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 1,
+  },
+  flagSwitch: {
+    flexShrink: 0,
+  },
+  helpDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 1.5,
+    borderColor: '#111111',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  helpDotDark: {
+    borderColor: '#FFFFFF',
+  },
+  helpMark: {
+    color: '#111111',
+    fontSize: 11,
+    fontWeight: '800',
+    marginTop: -0.5,
+  },
+  helpMarkDark: {
+    color: '#FFFFFF',
   },
   cropLabel: {
     fontSize: 13,
@@ -1592,6 +1828,11 @@ const styles = StyleSheet.create({
   empty: {
     marginTop: 22,
     fontSize: 15,
+    color: '#6E6E6E',
+  },
+  pageSize: {
+    marginTop: 18,
+    fontSize: 14,
     color: '#6E6E6E',
   },
   pageGrid: {
@@ -1693,10 +1934,39 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: -1,
   },
-  error: {
-    marginTop: 16,
-    color: '#D81B60',
+  errorBanner: {
+    marginTop: 58,
+    marginHorizontal: 20,
+    backgroundColor: '#111111',
+    borderRadius: 18,
+    paddingLeft: 16,
+    paddingRight: 12,
+    paddingVertical: 12,
+    zIndex: 2,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+  },
+  errorBannerCopy: {
+    flex: 1,
+  },
+  errorBannerClose: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '700',
+    lineHeight: 24,
+  },
+  errorBannerText: {
+    color: '#FFD600',
     fontSize: 15,
+    fontWeight: '700',
+    lineHeight: 21,
+  },
+  errorBannerJob: {
+    marginTop: 6,
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontVariant: ['tabular-nums'],
   },
   statusRow: {
     marginTop: 18,
@@ -1708,6 +1978,12 @@ const styles = StyleSheet.create({
     color: '#111111',
     fontSize: 16,
     fontWeight: '700',
+  },
+  jobId: {
+    marginTop: 8,
+    color: '#888888',
+    fontSize: 13,
+    fontVariant: ['tabular-nums'],
   },
   resultCard: {
     backgroundColor: '#111111',
@@ -1744,8 +2020,9 @@ const styles = StyleSheet.create({
     marginTop: 14,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'space-between',
     gap: 10,
+    paddingHorizontal: 12,
   },
   resultCropLabel: {
     fontSize: 13,
@@ -2105,6 +2382,40 @@ const styles = StyleSheet.create({
   },
   confirmOk: {
     flex: 1,
+    backgroundColor: '#FFD600',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  helpScrim: {
+    flex: 1,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(17, 17, 17, 0.45)',
+    paddingHorizontal: 28,
+  },
+  helpCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 28,
+    paddingHorizontal: 22,
+    paddingTop: 24,
+    paddingBottom: 20,
+  },
+  helpTitle: {
+    color: '#111111',
+    fontSize: 24,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  helpCopy: {
+    marginTop: 10,
+    color: '#5A5A5A',
+    fontSize: 15,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  helpClose: {
+    marginTop: 20,
     backgroundColor: '#FFD600',
     borderRadius: 18,
     paddingVertical: 14,

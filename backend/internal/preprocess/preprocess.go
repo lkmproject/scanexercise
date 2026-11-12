@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	jpegQuality    = 95
-	jpegMaxBytes   = 6_000_000
-	jpegMinQuality = 70
+	jpegQuality       = 99
+	textInMaxLongEdge = 1920
+	textInQuality     = 95
+	textInMaxBytes    = 3_000_000
+	textInMinQuality  = 70
 )
 
 func PreparePage(data []byte, maxLongEdge int) ([]byte, error) {
@@ -41,11 +43,83 @@ func PreparePage(data []byte, maxLongEdge int) ([]byte, error) {
 }
 
 func ToJPEG(data []byte) ([]byte, error) {
+	if len(data) >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err == nil {
+			long := cfg.Width
+			if cfg.Height > long {
+				long = cfg.Height
+			}
+			if long > 0 && long <= textInMaxLongEdge {
+				return data, nil
+			}
+		}
+	}
 	img, err := decodeImage(data, false)
 	if err != nil {
 		return nil, err
 	}
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	long := width
+	if height > long {
+		long = height
+	}
+	if long > textInMaxLongEdge {
+		nextWidth := max(int(float64(width)*float64(textInMaxLongEdge)/float64(long)), 1)
+		nextHeight := max(int(float64(height)*float64(textInMaxLongEdge)/float64(long)), 1)
+		img = resize(img, nextWidth, nextHeight)
+	}
 	return encodeJPEGAt(img, jpegQuality)
+}
+
+func ForTextIn(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, errors.New("cannot read image")
+	}
+	if len(data) <= textInMaxBytes {
+		orient := jpegOrientation(data)
+		if orient <= 1 {
+			cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+			if err == nil {
+				long := cfg.Width
+				if cfg.Height > long {
+					long = cfg.Height
+				}
+				if long > 0 && long <= textInMaxLongEdge {
+					return data, nil
+				}
+			}
+		}
+	}
+	img, err := decodeImage(data, true)
+	if err != nil {
+		return nil, errors.New("cannot read image")
+	}
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	long := width
+	if height > long {
+		long = height
+	}
+	if long > textInMaxLongEdge {
+		nextWidth := max(int(float64(width)*float64(textInMaxLongEdge)/float64(long)), 1)
+		nextHeight := max(int(float64(height)*float64(textInMaxLongEdge)/float64(long)), 1)
+		img = resize(img, nextWidth, nextHeight)
+	}
+	quality := textInQuality
+	encoded, err := encodeJPEGAt(img, quality)
+	if err != nil {
+		return nil, err
+	}
+	for len(encoded) > textInMaxBytes && quality > textInMinQuality {
+		quality -= 5
+		encoded, err = encodeJPEGAt(img, quality)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return encoded, nil
 }
 
 func decodeImage(data []byte, autoOrient bool) (image.Image, error) {
@@ -66,19 +140,7 @@ func resize(src image.Image, width, height int) image.Image {
 }
 
 func encodeJPEG(img image.Image) ([]byte, error) {
-	quality := jpegQuality
-	encoded, err := encodeJPEGAt(img, quality)
-	if err != nil {
-		return nil, err
-	}
-	for len(encoded) > jpegMaxBytes && quality > jpegMinQuality {
-		quality -= 5
-		encoded, err = encodeJPEGAt(img, quality)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return encoded, nil
+	return encodeJPEGAt(img, jpegQuality)
 }
 
 func encodeJPEGAt(img image.Image, quality int) ([]byte, error) {

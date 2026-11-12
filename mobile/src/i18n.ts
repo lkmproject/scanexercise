@@ -1,4 +1,6 @@
 import { NativeModules } from 'react-native';
+
+import { MAX_PAGES } from './config';
 import {
   documentDirectory,
   readAsStringAsync,
@@ -33,8 +35,16 @@ type Copy = {
   pending: string;
   noNewPages: string;
   crop: string;
+  cropHelpTitle: string;
+  cropHelp: string;
+  binarization: string;
+  binarizationHelpTitle: string;
+  binarizationHelp: string;
   empty: string;
+  totalSize: (kb: number) => string;
   clearing: string;
+  clearingTimeout: string;
+  jobId: (id: string) => string;
   preparingPdf: string;
   downloadPdf: string;
   shareBlank: string;
@@ -61,6 +71,7 @@ type Copy = {
   serverFailed: string;
   tooManyPages: (n: number) => string;
   scanFailed: string;
+  cameraDenied: string;
   noPages: string;
   saveFailed: string;
   pdfFailed: string;
@@ -74,6 +85,18 @@ type Copy = {
   remainingTimes: string;
   notEnoughErases: string;
   logout: string;
+  authInvalid: string;
+  authUnavailable: string;
+  authFailed: string;
+  authUnauthorized: string;
+  invalidRequest: string;
+  noPagesUploaded: string;
+  invalidImage: string;
+  imageTooLarge: string;
+  jobNotFound: string;
+  jobNotReady: string;
+  pageNotFound: string;
+  internalError: string;
 };
 
 export const copy: Record<Locale, Copy> = {
@@ -92,6 +115,7 @@ export const copy: Record<Locale, Copy> = {
       '清除手寫、塗鴉和批改痕跡，印刷題目原樣留下。',
       '繁體簡體不會互轉，只改 App 介面語言。',
       '需要時可開啟切邊，裁掉紙張外的邊。',
+      '需要時可開啟二值化，讓卷面更清楚。',
       '處理後可放大查看，左右滑動換頁。',
       '按「看修改前」對比原圖與清除結果。',
       '下載 PDF 帶走；試卷只留在這次處理裡。',
@@ -105,8 +129,17 @@ export const copy: Record<Locale, Copy> = {
     pending: '未清除',
     noNewPages: '沒有新圖要清除。',
     crop: '切邊',
+    cropHelpTitle: '什麼是切邊',
+    cropHelp: '打開後會裁掉紙張外面的桌面、背景，只留下試卷本身。拍歪一點的邊也比較容易修齊。',
+    binarization: '二值化',
+    binarizationHelpTitle: '什麼是二值化',
+    binarizationHelp:
+      '打開後會把字和線條變清楚一點，紙上的髒點、陰影也比較不明顯。還是彩色，不會變成只有黑和白的影印效果。',
     empty: '還沒有頁面。點下面相機掃描。',
+    totalSize: (kb) => `共 ${kb} KB`,
     clearing: '正在清除筆跡',
+    clearingTimeout: '清除逾時，請再試一次',
+    jobId: (id) => `工作 ${id}`,
     preparingPdf: '準備 PDF',
     downloadPdf: '下載 PDF',
     shareBlank: '分享空白卷',
@@ -132,7 +165,8 @@ export const copy: Record<Locale, Copy> = {
     modelFailed: '模型呼叫失敗',
     serverFailed: '無法連線到伺服器',
     tooManyPages: (n) => `一次最多 ${n} 頁`,
-    scanFailed: '無法開啟掃描',
+    scanFailed: '無法開啟相機',
+    cameraDenied: '請允許使用相機',
     noPages: '還沒有頁面。先掃，再清。',
     saveFailed: '無法儲存檔案',
     pdfFailed: '無法下載 PDF',
@@ -146,6 +180,18 @@ export const copy: Record<Locale, Copy> = {
     remainingTimes: '次',
     notEnoughErases: '清除次數不足',
     logout: '登出',
+    authInvalid: 'Google 登入無效',
+    authUnavailable: '登入服務暫時無法使用',
+    authFailed: '登入失敗',
+    authUnauthorized: '請重新登入',
+    invalidRequest: '請求不正確',
+    noPagesUploaded: '沒有上傳頁面',
+    invalidImage: '無法讀取圖片',
+    imageTooLarge: '圖片太大',
+    jobNotFound: '工作不存在或已過期',
+    jobNotReady: '結果還沒準備好',
+    pageNotFound: '找不到這一頁',
+    internalError: '伺服器發生問題',
   },
   'zh-Hans': {
     subtitle: '拍完就能重做。',
@@ -162,6 +208,7 @@ export const copy: Record<Locale, Copy> = {
       '清除手写、涂鸦和批改痕迹，印刷题目原样留下。',
       '繁体简体不会互转，只改 App 界面语言。',
       '需要时可开启切边，裁掉纸张外的边。',
+      '需要时可开启二值化，让卷面更清楚。',
       '处理后可放大查看，左右滑动换页。',
       '按「看修改前」对比原图与清除结果。',
       '下载 PDF 带走；试卷只留在这次处理里。',
@@ -175,8 +222,17 @@ export const copy: Record<Locale, Copy> = {
     pending: '未清除',
     noNewPages: '没有新图要清除。',
     crop: '切边',
+    cropHelpTitle: '什么是切边',
+    cropHelp: '打开后会裁掉纸张外面的桌面、背景，只留下试卷本身。拍歪一点的边也比较容易修齐。',
+    binarization: '二值化',
+    binarizationHelpTitle: '什么是二值化',
+    binarizationHelp:
+      '打开后会把字和线条变清楚一点，纸上的脏点、阴影也比较不明显。还是彩色，不会变成只有黑和白的影印效果。',
     empty: '还没有页面。点下面相机扫描。',
+    totalSize: (kb) => `共 ${kb} KB`,
     clearing: '正在清除笔迹',
+    clearingTimeout: '清除超时，请再试一次',
+    jobId: (id) => `工作 ${id}`,
     preparingPdf: '准备 PDF',
     downloadPdf: '下载 PDF',
     shareBlank: '分享空白卷',
@@ -202,7 +258,8 @@ export const copy: Record<Locale, Copy> = {
     modelFailed: '模型调用失败',
     serverFailed: '无法连到服务器',
     tooManyPages: (n) => `一次最多 ${n} 页`,
-    scanFailed: '无法开启扫描',
+    scanFailed: '无法开启相机',
+    cameraDenied: '请允许使用相机',
     noPages: '还没有页面。先扫，再清。',
     saveFailed: '无法保存文件',
     pdfFailed: '无法下载 PDF',
@@ -216,6 +273,18 @@ export const copy: Record<Locale, Copy> = {
     remainingTimes: '次',
     notEnoughErases: '清除次数不足',
     logout: '登出',
+    authInvalid: 'Google 登录无效',
+    authUnavailable: '登录服务暂时无法使用',
+    authFailed: '登录失败',
+    authUnauthorized: '请重新登录',
+    invalidRequest: '请求不正确',
+    noPagesUploaded: '没有上传页面',
+    invalidImage: '无法读取图片',
+    imageTooLarge: '图片太大',
+    jobNotFound: '工作不存在或已过期',
+    jobNotReady: '结果还没准备好',
+    pageNotFound: '找不到这一页',
+    internalError: '服务器发生问题',
   },
   en: {
     subtitle: 'Snap it, then start over.',
@@ -232,6 +301,7 @@ export const copy: Record<Locale, Copy> = {
       'Erase handwriting and marks. Printed questions stay.',
       'Traditional and simplified text are never converted.',
       'Turn on crop when you want the paper edges trimmed.',
+      'Turn on binarize to sharpen the page.',
       'Pinch to zoom, swipe to the next page.',
       'Tap Before to compare the original with the result.',
       'Download a PDF. Pages stay only for this session.',
@@ -245,8 +315,17 @@ export const copy: Record<Locale, Copy> = {
     pending: 'New',
     noNewPages: 'No new pages to erase.',
     crop: 'Crop',
+    cropHelpTitle: 'What crop does',
+    cropHelp: 'Trims the table or background around the paper, so only the exam sheet remains. Slightly crooked edges are also straightened.',
+    binarization: 'Binarize',
+    binarizationHelpTitle: 'What binarize does',
+    binarizationHelp:
+      'Turns on a sharpening filter so text and lines look clearer, and stains or shadows fade a bit. The page stays in color; it does not become a black-and-white photocopy.',
     empty: 'No pages yet. Tap the camera below.',
+    totalSize: (kb) => `Total ${kb} KB`,
     clearing: 'Erasing handwriting',
+    clearingTimeout: 'Erasing timed out. Try again.',
+    jobId: (id) => `Job ${id}`,
     preparingPdf: 'Preparing PDF',
     downloadPdf: 'Download PDF',
     shareBlank: 'Share the blank paper',
@@ -272,7 +351,8 @@ export const copy: Record<Locale, Copy> = {
     modelFailed: 'Model request failed',
     serverFailed: "Couldn't reach the server",
     tooManyPages: (n) => `Up to ${n} pages at a time`,
-    scanFailed: "Couldn't open the scanner",
+    scanFailed: "Couldn't open the camera",
+    cameraDenied: 'Allow camera access to take a photo',
     noPages: 'No pages yet. Scan, then erase.',
     saveFailed: "Couldn't save the file",
     pdfFailed: "Couldn't download the PDF",
@@ -286,8 +366,53 @@ export const copy: Record<Locale, Copy> = {
     remainingTimes: '',
     notEnoughErases: 'Not enough erases',
     logout: 'Log out',
+    authInvalid: 'Invalid Google sign-in',
+    authUnavailable: 'Sign-in is unavailable',
+    authFailed: 'Sign-in failed',
+    authUnauthorized: 'Please sign in again',
+    invalidRequest: 'Invalid request',
+    noPagesUploaded: 'No pages uploaded',
+    invalidImage: "Can't read the image",
+    imageTooLarge: 'Image is too large',
+    jobNotFound: 'Job not found or expired',
+    jobNotReady: "Result isn't ready",
+    pageNotFound: 'Page not found',
+    internalError: 'Something went wrong',
   },
 };
+
+const apiReasons: Record<string, keyof Copy> = {
+  'invalid google sign-in': 'authInvalid',
+  'auth service unavailable': 'authUnavailable',
+  'sign-in failed': 'authFailed',
+  'unauthorized': 'authUnauthorized',
+  'invalid request': 'invalidRequest',
+  'no pages uploaded': 'noPagesUploaded',
+  'cannot read image': 'invalidImage',
+  'too many pages': 'tooManyPages',
+  'image too large': 'imageTooLarge',
+  'job not found or expired': 'jobNotFound',
+  'result not ready': 'jobNotReady',
+  'model call failed': 'modelFailed',
+  'page not found': 'pageNotFound',
+  'cannot create pdf': 'pdfFailed',
+  'not enough erases': 'notEnoughErases',
+  'internal error': 'internalError',
+  'model timed out': 'clearingTimeout',
+};
+
+export function localizeApiMessage(t: Copy, message: string): string {
+  const reason = message.includes(': ') ? message.slice(message.lastIndexOf(': ') + 2) : message;
+  const key = apiReasons[reason];
+  if (key == null) {
+    return message;
+  }
+  const value = t[key];
+  if (typeof value === 'function') {
+    return t.tooManyPages(MAX_PAGES);
+  }
+  return value;
+}
 
 const localeFile = documentDirectory == null ? null : `${documentDirectory}locale.txt`;
 

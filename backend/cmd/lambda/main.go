@@ -37,7 +37,7 @@ func handler(ctx context.Context, event json.RawMessage) (any, error) {
 	}
 	if probe.JobID != "" && len(probe.RequestContext) == 0 {
 		log.Printf("run job=%s", probe.JobID)
-		instance.Store.Run(probe.JobID)
+		instance.Store.RunContext(ctx, probe.JobID)
 		return map[string]string{"status": "ok"}, nil
 	}
 	var req events.APIGatewayV2HTTPRequest

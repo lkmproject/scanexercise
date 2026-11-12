@@ -5,7 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { loginGoogle } from './api';
 import { isGoogleCancel, signInWithGoogle } from './googleAuth';
 import { setAccessToken } from './session';
-import { copy, LOCALES, type Locale } from './i18n';
+import { copy, localizeApiMessage, LOCALES, type Locale } from './i18n';
 
 export default function AuthModal({
   visible,
@@ -59,7 +59,8 @@ export default function AuthModal({
     } catch (error) {
       if (!isGoogleCancel(error)) {
         console.error('Google sign-in failed', error);
-        setAuthError(t.googleFailed);
+        const message = error instanceof Error ? localizeApiMessage(t, error.message) : t.googleFailed;
+        setAuthError(message === (error instanceof Error ? error.message : '') ? t.googleFailed : message);
       }
     } finally {
       setGoogleBusy(false);

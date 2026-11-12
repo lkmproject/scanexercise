@@ -25,7 +25,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap .
 zip function.zip bootstrap
 ```
 
-環境變數設 `JWT_SECRET`、`GOOGLE_WEB_CLIENT_ID`、`TEXTIN_APP_ID`、`TEXTIN_SECRET_CODE`。Lambda timeout 設 **15 分鐘**（API Gateway 仍是 30 秒；擦除用同一 function 非同步再調一次）。執行角色需：DynamoDB `Users` 與 `Jobs`、S3 `arn:aws:s3:::scanexercise` 與 `arn:aws:s3:::scanexercise/*`、`lambda:InvokeFunction` 對自己。`Jobs` 表主鍵 `pk`+`sk`，TTL 屬性 `ttl`。S3 建議 lifecycle 24 小時刪 `jobs/`。API Gateway HTTP API 用 `ANY /scanexercise/{proxy+}`。App 的 `EXPO_PUBLIC_API_BASE_URL` 設到 `https://<api-id>.execute-api.ap-southeast-1.amazonaws.com/scanexercise`。單張圖超過約 6–10MB 時 Gateway 會擋，這版仍走 multipart。
+環境變數設 `JWT_SECRET`、`GOOGLE_WEB_CLIENT_ID`、`TEXTIN_APP_ID`、`TEXTIN_SECRET_CODE`。Lambda timeout 設 **15 分鐘**（API Gateway 仍是 30 秒；擦除用同一 function 非同步再調一次）。Worker 每頁寫 `updatedAt` 心跳；`GET /jobs/{id}` 若 running 超過 TextIn 逾時加 60 秒沒跳動（OOM 殺不掉 process 時），標失敗並退次，App 停止輪詢。執行角色需：DynamoDB `Users` 與 `Jobs`、S3 `arn:aws:s3:::scanexercise` 與 `arn:aws:s3:::scanexercise/*`、`lambda:InvokeFunction` 對自己。`Jobs` 表主鍵 `pk`+`sk`，TTL 屬性 `ttl`。S3 建議 lifecycle 24 小時刪 `jobs/`。App 先 `POST /uploads` 拿預簽 URL，把 JPEG 直接 PUT 到 S3，再 `POST /jobs` JSON `{keys}`，這樣上傳不受 Lambda 6MB 限制。S3 bucket 需允許 CORS PUT（`AllowedHeaders: content-type`，`AllowedOrigins: *`）。API Gateway HTTP API 用 `ANY /scanexercise/{proxy+}`。App 的 `EXPO_PUBLIC_API_BASE_URL` 設到 `https://<api-id>.execute-api.ap-southeast-1.amazonaws.com/scanexercise`。
 
 測試：
 

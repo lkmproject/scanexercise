@@ -27,15 +27,17 @@ import (
 )
 
 type fakeEditor struct {
-	results [][]byte
-	err     error
-	calls   [][]byte
-	crops   []int
+	results       [][]byte
+	err           error
+	calls         [][]byte
+	crops         []int
+	binarizations []int
 }
 
 func (f *fakeEditor) Edit(jpegBytes []byte, opts editor.Options) ([]byte, error) {
 	f.calls = append(f.calls, append([]byte(nil), jpegBytes...))
 	f.crops = append(f.crops, opts.Crop)
+	f.binarizations = append(f.binarizations, opts.Binarization)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -151,7 +153,7 @@ func newClientWithWallet(t *testing.T, ed editor.Editor, wallet jobs.Wallet) (*h
 	t.Helper()
 	settings := config.Settings{
 		DataDir:              t.TempDir(),
-		MaxPages:             20,
+		MaxPages:             10,
 		RetentionHours:       24,
 		MaxLongEdge:          100,
 		TextInTimeoutSeconds: 5,
@@ -182,6 +184,11 @@ func postPages(t *testing.T, client *http.Client, base string, files [][]byte) *
 
 func postPagesCrop(t *testing.T, client *http.Client, base string, files [][]byte, crop string) *http.Response {
 	t.Helper()
+	return postPagesFlags(t, client, base, files, crop, "")
+}
+
+func postPagesFlags(t *testing.T, client *http.Client, base string, files [][]byte, crop, binarization string) *http.Response {
+	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	for index, file := range files {
@@ -195,6 +202,11 @@ func postPagesCrop(t *testing.T, client *http.Client, base string, files [][]byt
 	}
 	if crop != "" {
 		if err := writer.WriteField("crop", crop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if binarization != "" {
+		if err := writer.WriteField("binarization", binarization); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -300,7 +312,7 @@ func TestPreprocessAppliesExifAndLimitsLongEdge(t *testing.T) {
 	}
 	bounds := prepared.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
-	if max(width, height) > 100 {
+	if max(width, height) > 1920 {
 		t.Fatalf("long edge %d", max(width, height))
 	}
 	if width >= height {
@@ -381,7 +393,7 @@ func TestModelFailureDoesNotReturnTheOriginal(t *testing.T) {
 	if preview.StatusCode != http.StatusOK {
 		t.Fatalf("preview status %d", preview.StatusCode)
 	}
-	if codeOf(previewPayload) != int32(apicode.JobFailed) {
+	if codeOf(previewPayload) != int32(apicode.PageNotFound) {
 		t.Fatalf("preview code %v", previewPayload["code"])
 	}
 	pdfResp, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/pdf")
@@ -397,33 +409,62 @@ func TestModelFailureDoesNotReturnTheOriginal(t *testing.T) {
 	}
 }
 
-func TestSecondPageFailureDiscardsPartialOutput(t *testing.T) {
-	ts, client := newClient(t, &failSecond{})
+func TestSecondPageFailureKeepsEarlierPages(t *testing.T) {
+	editor := &failSecond{}
+	wallet := &memoryWallet{remaining: 3}
+	ts, client := newClientWithWallet(t, editor, wallet)
 	resp := postPages(t, client, apiBase(ts), [][]byte{
 		jpegColor(color.RGBA{R: 255, A: 255}, 20, 10),
 		jpegColor(color.RGBA{B: 255, A: 255}, 20, 10),
+		jpegColor(color.RGBA{G: 255, A: 255}, 20, 10),
 	})
-	jobID := decodeData(t, resp)["id"].(string)
+	created := decodeData(t, resp)
+	if remainingOf(created) != 0 {
+		t.Fatalf("create remaining %d", remainingOf(created))
+	}
+	jobID := created["id"].(string)
 	body := wait(t, client, apiBase(ts), jobID)
 	if body["status"] != "failed" || body["error"] != "model timed out" {
+		t.Fatalf("body %#v", body)
+	}
+	if remainingOf(body) != 2 {
+		t.Fatalf("remaining %d", remainingOf(body))
+	}
+	if wallet.remainingNow() != 2 {
+		t.Fatalf("wallet %d", wallet.remainingNow())
+	}
+	if editor.calls != 2 {
+		t.Fatalf("textin calls %d", editor.calls)
+	}
+	previews, _ := body["previews"].([]any)
+	if len(previews) != 1 || body["pdf"] != nil {
 		t.Fatalf("body %#v", body)
 	}
 	preview, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/preview/0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	previewPayload := decodeEnvelope(t, preview)
-	if preview.StatusCode != http.StatusOK {
-		t.Fatalf("preview status %d", preview.StatusCode)
+	defer preview.Body.Close()
+	image, err := io.ReadAll(preview.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if codeOf(previewPayload) != int32(apicode.JobFailed) {
-		t.Fatalf("preview code %v", previewPayload["code"])
+	if preview.StatusCode != http.StatusOK || preview.Header.Get("Content-Type") != "image/jpeg" || !bytes.HasPrefix(image, []byte{0xFF, 0xD8}) {
+		t.Fatalf("preview status %d type %s", preview.StatusCode, preview.Header.Get("Content-Type"))
+	}
+	missing, err := client.Get(apiBase(ts) + "/jobs/" + jobID + "/preview/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingPayload := decodeEnvelope(t, missing)
+	if codeOf(missingPayload) != int32(apicode.PageNotFound) {
+		t.Fatalf("missing preview %#v", missingPayload)
 	}
 }
 
 func TestRejectsTooManyPagesAndUnreadableImages(t *testing.T) {
 	ts, client := newClient(t, &fakeEditor{})
-	tooMany := make([][]byte, 21)
+	tooMany := make([][]byte, 11)
 	for i := range tooMany {
 		tooMany[i] = jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)
 	}
@@ -452,7 +493,7 @@ func TestRejectsTooManyPagesAndUnreadableImages(t *testing.T) {
 func TestExpiredJobIsRemoved(t *testing.T) {
 	settings := config.Settings{
 		DataDir:              t.TempDir(),
-		MaxPages:             20,
+		MaxPages:             10,
 		RetentionHours:       24,
 		MaxLongEdge:          100,
 		TextInTimeoutSeconds: 5,
@@ -538,6 +579,23 @@ func TestCropFlagIsPassedToEditor(t *testing.T) {
 	}
 }
 
+func TestBinarizationFlagIsPassedToEditor(t *testing.T) {
+	ed := &fakeEditor{results: [][]byte{jpegColor(color.RGBA{G: 255, A: 255}, 16, 16)}}
+	ts, client := newClient(t, ed)
+	resp := postPagesFlags(t, client, apiBase(ts), [][]byte{jpegColor(color.RGBA{R: 255, A: 255}, 20, 10)}, "", "1")
+	jobID := decodeData(t, resp)["id"].(string)
+	body := wait(t, client, apiBase(ts), jobID)
+	if body["status"] != "succeeded" {
+		t.Fatalf("status %v", body["status"])
+	}
+	if body["binarization"] != float64(1) {
+		t.Fatalf("binarization %v", body["binarization"])
+	}
+	if len(ed.binarizations) != 1 || ed.binarizations[0] != 1 {
+		t.Fatalf("editor binarization %#v", ed.binarizations)
+	}
+}
+
 func TestPDFFromUploads(t *testing.T) {
 	ts, client := newClient(t, &fakeEditor{})
 	var body bytes.Buffer
@@ -577,10 +635,30 @@ func TestPDFFromUploads(t *testing.T) {
 	}
 }
 
+func TestUploadsUnavailableOnDisk(t *testing.T) {
+	ts, client := newClient(t, &fakeEditor{})
+	req, err := http.NewRequest(http.MethodPost, apiBase(ts)+"/uploads", strings.NewReader(`{"count":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := decodeEnvelope(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if codeOf(payload) != int32(apicode.InvalidRequest) {
+		t.Fatalf("code %v reason %v", payload["code"], payload["reason"])
+	}
+}
+
 func TestCreateJobUnauthorized(t *testing.T) {
 	settings := config.Settings{
 		DataDir:              t.TempDir(),
-		MaxPages:             20,
+		MaxPages:             10,
 		RetentionHours:       24,
 		MaxLongEdge:          100,
 		TextInTimeoutSeconds: 5,

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -39,16 +40,20 @@ func fail(code apicode.Code, message string) error {
 }
 
 type Job struct {
-	ID        string  `json:"id"`
-	UserID    string  `json:"user_id,omitempty"`
-	Status    string  `json:"status"`
-	PageCount int     `json:"page_count"`
-	Crop      int     `json:"crop"`
-	Charged   int     `json:"charged,omitempty"`
-	Refunded  bool    `json:"refunded,omitempty"`
-	Error     *string `json:"error"`
-	CreatedAt string  `json:"created_at"`
-	ExpiresAt string  `json:"expires_at"`
+	ID           string   `json:"id"`
+	UserID       string   `json:"user_id,omitempty"`
+	Status       string   `json:"status"`
+	PageCount    int      `json:"page_count"`
+	Crop         int      `json:"crop"`
+	Binarization int      `json:"binarization"`
+	Charged      int      `json:"charged,omitempty"`
+	Completed    int      `json:"completed,omitempty"`
+	Refunded     bool     `json:"refunded,omitempty"`
+	Error        *string  `json:"error"`
+	CreatedAt    string   `json:"created_at"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+	ExpiresAt    string   `json:"expires_at"`
+	UploadKeys   []string `json:"upload_keys,omitempty"`
 }
 
 type Wallet interface {
@@ -65,6 +70,18 @@ type fileStore interface {
 	remove(ctx context.Context, jobID string) error
 	removeBlobs(ctx context.Context, jobID string, rels ...string) error
 	listIDs(ctx context.Context) []string
+}
+
+type UploadSlot struct {
+	Key string `json:"key"`
+	URL string `json:"url"`
+}
+
+type objectStore interface {
+	presignPuts(ctx context.Context, keys []string, expire time.Duration) ([]string, error)
+	headKey(ctx context.Context, key string) error
+	readKey(ctx context.Context, key string) ([]byte, error)
+	deleteKey(ctx context.Context, key string) error
 }
 
 type Store struct {
@@ -99,8 +116,87 @@ func (s *Store) SetAsyncStart(start func(jobID string) error) {
 	s.asyncStart = start
 }
 
-func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) {
+func (s *Store) Create(uploads [][]byte, crop, binarization int, userID string) (*Job, error) {
 	s.Cleanup()
+	prepared, err := s.prepareUploads(uploads)
+	if err != nil {
+		return nil, err
+	}
+	return s.finishCreate(context.Background(), prepared, crop, binarization, userID)
+}
+
+func (s *Store) CreateUploadSlots(ctx context.Context, userID string, count int) ([]UploadSlot, error) {
+	if count <= 0 {
+		return nil, fail(apicode.NoPages, "")
+	}
+	if count > s.settings.MaxPages {
+		return nil, fail(apicode.TooManyPages, "at most "+strconv.Itoa(s.settings.MaxPages)+" pages")
+	}
+	if s.wallet != nil {
+		remaining, err := s.wallet.Balance(ctx, userID)
+		if err != nil {
+			return nil, fail(apicode.Internal, "cannot read balance")
+		}
+		if remaining < count {
+			return nil, fail(apicode.InsufficientCredits, "")
+		}
+	}
+	objects, ok := s.files.(objectStore)
+	if !ok {
+		return nil, fail(apicode.InvalidRequest, "direct upload unavailable")
+	}
+	batch := hexUUID()
+	owner := safeUserID(userID)
+	keys := make([]string, count)
+	for i := 0; i < count; i++ {
+		keys[i] = "uploads/" + owner + "/" + batch + "/" + strconv.Itoa(i) + ".jpg"
+	}
+	urls, err := objects.presignPuts(ctx, keys, 15*time.Minute)
+	if err != nil {
+		return nil, fail(apicode.Internal, "cannot create upload")
+	}
+	slots := make([]UploadSlot, count)
+	for i := range keys {
+		slots[i] = UploadSlot{Key: keys[i], URL: urls[i]}
+	}
+	return slots, nil
+}
+
+func (s *Store) CreateFromKeys(ctx context.Context, keys []string, crop, binarization int, userID string) (*Job, error) {
+	if len(keys) == 0 {
+		return nil, fail(apicode.NoPages, "")
+	}
+	if len(keys) > s.settings.MaxPages {
+		return nil, fail(apicode.TooManyPages, "at most "+strconv.Itoa(s.settings.MaxPages)+" pages")
+	}
+	objects, ok := s.files.(objectStore)
+	if !ok {
+		return nil, fail(apicode.InvalidRequest, "direct upload unavailable")
+	}
+	s.Cleanup()
+	owner := safeUserID(userID)
+	for _, key := range keys {
+		if !validUploadKey(owner, key) {
+			return nil, fail(apicode.InvalidRequest, "invalid upload key")
+		}
+		if err := objects.headKey(ctx, key); err != nil {
+			return nil, fail(apicode.InvalidImage, "upload missing")
+		}
+	}
+	job, err := s.finishCreateMeta(ctx, len(keys), crop, binarization, userID, keys)
+	if err != nil {
+		return nil, err
+	}
+	if s.asyncStart == nil {
+		if err := s.ingestUploadKeys(ctx, job); err != nil {
+			_ = s.files.remove(ctx, job.ID)
+			return nil, err
+		}
+	}
+	return job, nil
+}
+
+func (s *Store) prepareUploads(uploads [][]byte) ([][]byte, error) {
 	if len(uploads) == 0 {
 		return nil, fail(apicode.NoPages, "")
 	}
@@ -114,39 +210,117 @@ func (s *Store) Create(uploads [][]byte, crop int, userID string) (*Job, error) 
 	}
 	prepared := make([][]byte, 0, len(uploads))
 	for _, upload := range uploads {
-		page, err := preprocess.PreparePage(upload, s.settings.MaxLongEdge)
+		page, err := preprocess.ForTextIn(upload)
 		if err != nil {
 			return nil, fail(apicode.InvalidImage, err.Error())
 		}
 		prepared = append(prepared, page)
 	}
-	jobID := hexUUID()
-	ctx := context.Background()
+	return prepared, nil
+}
+
+func (s *Store) finishCreate(ctx context.Context, prepared [][]byte, crop, binarization int, userID string) (*Job, error) {
+	job, err := s.finishCreateMeta(ctx, len(prepared), crop, binarization, userID, nil)
+	if err != nil {
+		return nil, err
+	}
 	for index, page := range prepared {
-		if err := s.files.writeBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg", page); err != nil {
-			_ = s.files.remove(ctx, jobID)
+		if err := s.files.writeBlob(ctx, job.ID, "input/"+strconv.Itoa(index)+".jpg", page); err != nil {
+			_ = s.files.remove(ctx, job.ID)
 			return nil, fail(apicode.Internal, "cannot create job")
 		}
 	}
+	return job, nil
+}
+
+func (s *Store) finishCreateMeta(ctx context.Context, pageCount, crop, binarization int, userID string, uploadKeys []string) (*Job, error) {
+	jobID := hexUUID()
 	if crop != 1 {
 		crop = 0
 	}
+	if binarization != 1 {
+		binarization = 0
+	}
 	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
 	job := &Job{
-		ID:        jobID,
-		UserID:    userID,
-		Status:    "pending",
-		PageCount: len(prepared),
-		Crop:      crop,
-		Error:     nil,
-		CreatedAt: now.Format(time.RFC3339Nano),
-		ExpiresAt: now.Add(time.Duration(s.settings.RetentionHours) * time.Hour).Format(time.RFC3339Nano),
+		ID:           jobID,
+		UserID:       userID,
+		Status:       "pending",
+		PageCount:    pageCount,
+		Crop:         crop,
+		Binarization: binarization,
+		Error:        nil,
+		CreatedAt:    stamp,
+		UpdatedAt:    stamp,
+		ExpiresAt:    now.Add(time.Duration(s.settings.RetentionHours) * time.Hour).Format(time.RFC3339Nano),
+		UploadKeys:   append([]string(nil), uploadKeys...),
 	}
 	if err := s.write(job); err != nil {
 		_ = s.files.remove(ctx, jobID)
 		return nil, fail(apicode.Internal, "cannot create job")
 	}
 	return job, nil
+}
+
+func (s *Store) ingestUploadKeys(ctx context.Context, job *Job) error {
+	objects, ok := s.files.(objectStore)
+	if !ok {
+		return fail(apicode.InvalidRequest, "direct upload unavailable")
+	}
+	if job == nil || len(job.UploadKeys) == 0 {
+		return nil
+	}
+	keys := append([]string(nil), job.UploadKeys...)
+	for index, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return fail(apicode.Internal, "model timed out")
+		}
+		log.Printf("ingest job=%s page=%d key=%s", job.ID, index, key)
+		s.touch(job)
+		raw, err := objects.readKey(ctx, key)
+		if err != nil {
+			return fail(apicode.InvalidImage, "upload missing")
+		}
+		prepared, err := s.prepareUploads([][]byte{raw})
+		if err != nil {
+			return err
+		}
+		if err := s.files.writeBlob(ctx, job.ID, "input/"+strconv.Itoa(index)+".jpg", prepared[0]); err != nil {
+			return fail(apicode.Internal, "cannot create job")
+		}
+	}
+	for _, key := range keys {
+		_ = objects.deleteKey(ctx, key)
+	}
+	job.UploadKeys = nil
+	job.PageCount = len(keys)
+	return s.write(job)
+}
+
+func validUploadKey(userID, key string) bool {
+	prefix := "uploads/" + userID + "/"
+	if userID == "" || !strings.HasPrefix(key, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(key, prefix)
+	if rest == "" || strings.Contains(rest, "..") || strings.HasPrefix(rest, "/") {
+		return false
+	}
+	return strings.HasSuffix(rest, ".jpg")
+}
+
+func safeUserID(userID string) string {
+	var b strings.Builder
+	for _, r := range userID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 func (s *Store) Charge(ctx context.Context, job *Job) error {
@@ -219,21 +393,61 @@ func (s *Store) Start(jobID string) {
 }
 
 func (s *Store) Run(jobID string) {
-	ctx := context.Background()
+	s.RunContext(context.Background(), jobID)
+}
+
+func (s *Store) RunContext(ctx context.Context, jobID string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("run panic job=%s: %v", jobID, rec)
+			job, _ := s.read(jobID)
+			if job != nil && (job.Status == "pending" || job.Status == "running") {
+				s.markFailed(job, "model call failed")
+			}
+		}
+	}()
 	job, err := s.read(jobID)
-	if err != nil || job == nil || job.Status != "pending" {
+	if err != nil || job == nil {
+		log.Printf("run missing job=%s err=%v", jobID, err)
 		return
 	}
+	if job.Status != "pending" {
+		log.Printf("run skip job=%s status=%s", jobID, job.Status)
+		return
+	}
+	log.Printf("run start job=%s pages=%d keys=%d", jobID, job.PageCount, len(job.UploadKeys))
 	job.Status = "running"
-	_ = s.write(job)
+	s.touch(job)
+	if len(job.UploadKeys) > 0 {
+		if err := s.ingestUploadKeys(ctx, job); err != nil {
+			message := "cannot read image"
+			var jobErr *Error
+			if errors.As(err, &jobErr) && jobErr.Message != "" {
+				message = jobErr.Message
+			}
+			s.markFailed(job, message)
+			return
+		}
+	}
 	pages := make([][]byte, 0, job.PageCount)
 	for index := 0; index < job.PageCount; index++ {
+		if err := ctx.Err(); err != nil {
+			s.markFailed(job, "model timed out")
+			return
+		}
+		if !s.touch(job) || job.Status != "running" {
+			log.Printf("run abort job=%s status=%s", jobID, job.Status)
+			return
+		}
 		source, err := s.files.readBlob(ctx, jobID, "input/"+strconv.Itoa(index)+".jpg")
 		if err != nil {
 			s.markFailed(job, "model call failed")
 			return
 		}
-		edited, err := s.editor.Edit(source, editor.Options{Crop: job.Crop})
+		edited, err := s.editor.Edit(source, editor.Options{Crop: job.Crop, Binarization: job.Binarization})
 		if err != nil {
 			message := "model call failed"
 			var edErr *editor.Error
@@ -243,13 +457,16 @@ func (s *Store) Run(jobID string) {
 			s.markFailed(job, message)
 			return
 		}
-		pages = append(pages, edited)
-	}
-	for index, page := range pages {
-		if err := s.files.writeBlob(ctx, jobID, "output/"+strconv.Itoa(index)+".jpg", page); err != nil {
+		if err := s.files.writeBlob(ctx, jobID, "output/"+strconv.Itoa(index)+".jpg", edited); err != nil {
 			s.markFailed(job, "model call failed")
 			return
 		}
+		job.Completed = index + 1
+		if !s.touch(job) {
+			log.Printf("run abort job=%s status=%s", jobID, job.Status)
+			return
+		}
+		pages = append(pages, edited)
 	}
 	pdfBytes, err := pdf.Build(pages)
 	if err != nil {
@@ -260,9 +477,14 @@ func (s *Store) Run(jobID string) {
 		s.markFailed(job, "model call failed")
 		return
 	}
+	if !s.syncOpen(job) {
+		log.Printf("run abort job=%s status=%s", jobID, job.Status)
+		return
+	}
 	job.Status = "succeeded"
 	job.Error = nil
 	_ = s.write(job)
+	log.Printf("run done job=%s pages=%d", jobID, job.PageCount)
 }
 
 func (s *Store) Get(jobID string) (*Job, error) {
@@ -273,7 +495,67 @@ func (s *Store) Get(jobID string) (*Job, error) {
 		}
 		return nil, err
 	}
-	return s.read(jobID)
+	job, err := s.read(jobID)
+	if err != nil || job == nil {
+		return job, err
+	}
+	s.reclaimStale(job)
+	return job, nil
+}
+
+func (s *Store) touch(job *Job) bool {
+	if job == nil || !s.syncOpen(job) {
+		return false
+	}
+	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	return s.write(job) == nil
+}
+
+func (s *Store) syncOpen(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	latest, err := s.read(job.ID)
+	if err != nil || latest == nil {
+		return false
+	}
+	job.Charged = latest.Charged
+	job.Refunded = latest.Refunded
+	if latest.Completed > job.Completed {
+		job.Completed = latest.Completed
+	}
+	if latest.Status != "pending" && latest.Status != "running" {
+		job.Status = latest.Status
+		job.Error = latest.Error
+		return false
+	}
+	return true
+}
+
+func (s *Store) reclaimStale(job *Job) {
+	if job == nil || (job.Status != "pending" && job.Status != "running") {
+		return
+	}
+	stamp := job.UpdatedAt
+	if stamp == "" {
+		stamp = job.CreatedAt
+	}
+	updated, err := parseTime(stamp)
+	if err != nil {
+		return
+	}
+	limit := 13 * time.Minute
+	if job.Status == "running" {
+		limit = time.Duration(s.settings.TextInTimeoutSeconds+60) * time.Second
+		if limit < 4*time.Minute {
+			limit = 4 * time.Minute
+		}
+	}
+	if time.Since(updated.UTC()) < limit {
+		return
+	}
+	log.Printf("stale job=%s status=%s age=%s", job.ID, job.Status, time.Since(updated.UTC()).Truncate(time.Second))
+	s.markFailed(job, "model timed out")
 }
 
 func (s *Store) Preview(jobID string, index int) ([]byte, error) {
@@ -281,10 +563,16 @@ func (s *Store) Preview(jobID string, index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := RequireReady(job); err != nil {
-		return nil, err
+	limit := 0
+	switch job.Status {
+	case "succeeded":
+		limit = job.PageCount
+	case "failed":
+		limit = job.Completed
+	default:
+		return nil, fail(apicode.JobNotReady, "")
 	}
-	if index < 0 || index >= job.PageCount {
+	if index < 0 || index >= limit {
 		return nil, fail(apicode.PageNotFound, "")
 	}
 	data, err := s.files.readBlob(context.Background(), jobID, "output/"+strconv.Itoa(index)+".jpg")
@@ -320,7 +608,14 @@ func (s *Store) Cleanup() {
 }
 
 func (s *Store) markFailed(job *Job, message string) {
-	_ = s.files.removeBlobs(context.Background(), job.ID, "output/", "result.pdf")
+	if job == nil || !s.syncOpen(job) {
+		return
+	}
+	if job.Completed <= 0 {
+		_ = s.files.removeBlobs(context.Background(), job.ID, "output/", "result.pdf")
+	} else {
+		_ = s.files.removeBlobs(context.Background(), job.ID, "result.pdf")
+	}
 	job.Status = "failed"
 	job.Error = &message
 	s.refund(job)
@@ -328,10 +623,17 @@ func (s *Store) markFailed(job *Job, message string) {
 }
 
 func (s *Store) refund(job *Job) {
-	if s.wallet == nil || job == nil || job.Refunded || job.Charged <= 0 || job.UserID == "" {
+	if s.wallet == nil || job == nil || job.Refunded || job.UserID == "" {
 		return
 	}
-	if err := s.wallet.Refund(context.Background(), job.UserID, job.Charged); err != nil {
+	pages := job.Charged - job.Completed
+	if pages <= 0 {
+		if job.Charged > 0 {
+			job.Refunded = true
+		}
+		return
+	}
+	if err := s.wallet.Refund(context.Background(), job.UserID, pages); err != nil {
 		log.Printf("refund job=%s: %v", job.ID, err)
 		return
 	}

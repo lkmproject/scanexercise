@@ -79,8 +79,8 @@ func TestEditPostsBinaryHandwrittenErase(t *testing.T) {
 	if seen.Get("Content-Type") != "application/octet-stream" {
 		t.Fatalf("content-type %s", seen.Get("Content-Type"))
 	}
-	if !bytes.Equal(seenBody, source) {
-		t.Fatal("body mismatch")
+	if len(seenBody) < 2 || seenBody[0] != 0xFF || seenBody[1] != 0xD8 {
+		t.Fatal("textin body is not jpeg")
 	}
 	if len(result) < 2 || result[0] != 0xFF || result[1] != 0xD8 {
 		t.Fatal("result is not jpeg")
@@ -106,6 +106,29 @@ func TestEditSendsCropWhenEnabled(t *testing.T) {
 		t.Fatalf("url %s", seenURL)
 	}
 	if !strings.Contains(seenURL, "binarization=0") {
+		t.Fatalf("url %s", seenURL)
+	}
+}
+
+func TestEditSendsBinarizationWhenEnabled(t *testing.T) {
+	var seenURL string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		seenURL = req.URL.String()
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewReader(successPayload(jpegBytes(20, 20)))),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	ed := editor.NewTextIn("app-id", "secret-code", 30)
+	ed.Client = client
+	if _, err := ed.Edit(jpegBytes(8, 8), editor.Options{Binarization: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seenURL, "binarization=1") {
+		t.Fatalf("url %s", seenURL)
+	}
+	if !strings.Contains(seenURL, "crop=0") {
 		t.Fatalf("url %s", seenURL)
 	}
 }

@@ -54,13 +54,21 @@ func (t *TextIn) Edit(jpeg []byte, opts Options) ([]byte, error) {
 	if opts.Crop == 1 {
 		crop = 1
 	}
+	binarization := 0
+	if opts.Binarization == 1 {
+		binarization = 1
+	}
 	query := url.Values{}
 	query.Set("crop", strconv.Itoa(crop))                    // 0 skip crop, 1 crop
 	query.Set("dewarp", strconv.Itoa(t.Dewarp))              // 0 skip dewarp
-	query.Set("binarization", strconv.Itoa(t.Binarization))  // 0 skip binarization
+	query.Set("binarization", strconv.Itoa(binarization))    // 0 skip, 1 sharpen
 	query.Set("image_type", strconv.Itoa(t.ImageType))       // 1 return color image
 	query.Set("doc_direction", strconv.Itoa(t.DocDirection)) // 0 skip orientation
-	req, err := http.NewRequest(http.MethodPost, editURL+"?"+query.Encode(), bytes.NewReader(jpeg))
+	requestImage, err := preprocess.ForTextIn(jpeg)
+	if err != nil {
+		return nil, Fail("cannot read image")
+	}
+	req, err := http.NewRequest(http.MethodPost, editURL+"?"+query.Encode(), bytes.NewReader(requestImage))
 	if err != nil {
 		return nil, Fail("model call failed")
 	}

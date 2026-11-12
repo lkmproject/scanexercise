@@ -1,7 +1,8 @@
 package editor
 
 type Options struct {
-	Crop int
+	Crop         int
+	Binarization int
 }
 
 type Editor interface {

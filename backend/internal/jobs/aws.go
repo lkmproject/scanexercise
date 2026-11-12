@@ -32,21 +32,25 @@ type awsStore struct {
 }
 
 type jobItem struct {
-	PK        string  `dynamodbav:"pk"`
-	SK        string  `dynamodbav:"sk"`
-	Project   string  `dynamodbav:"project"`
-	JobID     string  `dynamodbav:"jobId"`
-	Type      string  `dynamodbav:"type"`
-	UserID    string  `dynamodbav:"userId"`
-	Status    string  `dynamodbav:"status"`
-	PageCount int     `dynamodbav:"pageCount"`
-	Crop      int     `dynamodbav:"crop"`
-	Charged   int     `dynamodbav:"charged"`
-	Refunded  bool    `dynamodbav:"refunded"`
-	Error     *string `dynamodbav:"error"`
-	CreatedAt string  `dynamodbav:"createdAt"`
-	ExpiresAt string  `dynamodbav:"expiresAt"`
-	TTL       int64   `dynamodbav:"ttl"`
+	PK           string   `dynamodbav:"pk"`
+	SK           string   `dynamodbav:"sk"`
+	Project      string   `dynamodbav:"project"`
+	JobID        string   `dynamodbav:"jobId"`
+	Type         string   `dynamodbav:"type"`
+	UserID       string   `dynamodbav:"userId"`
+	Status       string   `dynamodbav:"status"`
+	PageCount    int      `dynamodbav:"pageCount"`
+	Crop         int      `dynamodbav:"crop"`
+	Binarization int      `dynamodbav:"binarization"`
+	Charged      int      `dynamodbav:"charged"`
+	Completed    int      `dynamodbav:"completed"`
+	Refunded     bool     `dynamodbav:"refunded"`
+	Error        *string  `dynamodbav:"error"`
+	CreatedAt    string   `dynamodbav:"createdAt"`
+	UpdatedAt    string   `dynamodbav:"updatedAt,omitempty"`
+	ExpiresAt    string   `dynamodbav:"expiresAt"`
+	UploadKeys   []string `dynamodbav:"uploadKeys,omitempty"`
+	TTL          int64    `dynamodbav:"ttl"`
 }
 
 func newAWSStore(cfg aws.Config) *awsStore {
@@ -97,6 +101,60 @@ func (a *awsStore) readMeta(ctx context.Context, jobID string) (*Job, error) {
 		return nil, err
 	}
 	return fromItem(item), nil
+}
+
+func (a *awsStore) presignPuts(ctx context.Context, keys []string, expire time.Duration) ([]string, error) {
+	client := s3.NewPresignClient(a.s3)
+	urls := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out, err := client.PresignPutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(a.bucket),
+			Key:         aws.String(key),
+			ContentType: aws.String("image/jpeg"),
+		}, s3.WithPresignExpires(expire))
+		if err != nil {
+			return nil, err
+		}
+		urls = append(urls, out.URL)
+	}
+	return urls, nil
+}
+
+func (a *awsStore) headKey(ctx context.Context, key string) error {
+	_, err := a.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return os.ErrNotExist
+		}
+		return err
+	}
+	return nil
+}
+
+func (a *awsStore) readKey(ctx context.Context, key string) ([]byte, error) {
+	out, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	defer out.Body.Close()
+	return io.ReadAll(out.Body)
+}
+
+func (a *awsStore) deleteKey(ctx context.Context, key string) error {
+	_, err := a.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(a.bucket),
+		Key:    aws.String(key),
+	})
+	return err
 }
 
 func (a *awsStore) writeBlob(ctx context.Context, jobID, rel string, data []byte) error {
@@ -208,36 +266,44 @@ func toItem(job *Job) jobItem {
 		ttl = expires.Unix()
 	}
 	return jobItem{
-		PK:        jobPK(job.ID),
-		SK:        "META",
-		Project:   JobsProject,
-		JobID:     job.ID,
-		Type:      JobsType,
-		UserID:    job.UserID,
-		Status:    job.Status,
-		PageCount: job.PageCount,
-		Crop:      job.Crop,
-		Charged:   job.Charged,
-		Refunded:  job.Refunded,
-		Error:     job.Error,
-		CreatedAt: job.CreatedAt,
-		ExpiresAt: job.ExpiresAt,
-		TTL:       ttl,
+		PK:           jobPK(job.ID),
+		SK:           "META",
+		Project:      JobsProject,
+		JobID:        job.ID,
+		Type:         JobsType,
+		UserID:       job.UserID,
+		Status:       job.Status,
+		PageCount:    job.PageCount,
+		Crop:         job.Crop,
+		Binarization: job.Binarization,
+		Charged:      job.Charged,
+		Completed:    job.Completed,
+		Refunded:     job.Refunded,
+		Error:        job.Error,
+		CreatedAt:    job.CreatedAt,
+		UpdatedAt:    job.UpdatedAt,
+		ExpiresAt:    job.ExpiresAt,
+		UploadKeys:   job.UploadKeys,
+		TTL:          ttl,
 	}
 }
 
 func fromItem(item jobItem) *Job {
 	return &Job{
-		ID:        item.JobID,
-		UserID:    item.UserID,
-		Status:    item.Status,
-		PageCount: item.PageCount,
-		Crop:      item.Crop,
-		Charged:   item.Charged,
-		Refunded:  item.Refunded,
-		Error:     item.Error,
-		CreatedAt: item.CreatedAt,
-		ExpiresAt: item.ExpiresAt,
+		ID:           item.JobID,
+		UserID:       item.UserID,
+		Status:       item.Status,
+		PageCount:    item.PageCount,
+		Crop:         item.Crop,
+		Binarization: item.Binarization,
+		Charged:      item.Charged,
+		Completed:    item.Completed,
+		Refunded:     item.Refunded,
+		Error:        item.Error,
+		CreatedAt:    item.CreatedAt,
+		UpdatedAt:    item.UpdatedAt,
+		ExpiresAt:    item.ExpiresAt,
+		UploadKeys:   item.UploadKeys,
 	}
 }
 
