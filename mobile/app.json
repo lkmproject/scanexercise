@@ -14,6 +14,7 @@
       "infoPlist": {
         "NSCameraUsageDescription": "用來拍攝試卷。",
         "NSPhotoLibraryUsageDescription": "用來選取試卷圖片。",
+        "NSPhotoLibraryAddUsageDescription": "用來把清除後的試卷存進相簿。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         },
@@ -38,6 +39,15 @@
         "expo-image-picker",
         {
           "photosPermission": "用來選取試卷圖片。"
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "用來選取試卷圖片。",
+          "savePhotosPermission": "用來把清除後的試卷存進相簿。",
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": ["photo"]
         }
       ],
       [

@@ -18,6 +18,7 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import { cacheDirectory, downloadAsync, readAsStringAsync } from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
+import { Asset, requestPermissionsAsync } from 'expo-media-library';
 import * as Sharing from 'expo-sharing';
 
 import { createJob, failFromEnvelope, getJob, getMe, isUnauthorized, type Job } from './src/api';
@@ -150,6 +151,11 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
+  const [savingPage, setSavingPage] = useState<number | null>(null);
+  const [imageNotice, setImageNotice] = useState<string | null>(null);
+  const [imageNoticeOk, setImageNoticeOk] = useState(false);
+  const [photoSaved, setPhotoSaved] = useState<string | null>(null);
+  const [savedPhotoIds, setSavedPhotoIds] = useState<string[]>([]);
   const [selectedPage, setSelectedPage] = useState<{ uri: string; index: number } | null>(null);
   const [tab, setTab] = useState<Tab>('home');
   const [crop, setCrop] = useState(true);
@@ -569,11 +575,57 @@ export default function App() {
     setAuthOpen(true);
   }
 
+  async function shareImage(uri: string, index: number, inViewer = false) {
+    if (sharing || savingPage != null) {
+      return;
+    }
+    const sheetId = sheetsRef.current[index]?.id;
+    setSavingPage(index);
+    setError(null);
+    setImageNotice(null);
+    setImageNoticeOk(false);
+    setPhotoSaved(null);
+    const fail = (message: string) => {
+      setError(message);
+      setPhotoSaved(null);
+      if (inViewer) {
+        setImageNotice(message);
+        setImageNoticeOk(false);
+      }
+    };
+    try {
+      const permission = await requestPermissionsAsync(true);
+      if (!permission.granted) {
+        fail(t.photoDenied);
+        return;
+      }
+      await Asset.create(uri);
+      if (sheetId != null) {
+        setSavedPhotoIds((current) => (current.includes(sheetId) ? current : [...current, sheetId]));
+      }
+      setPhotoSaved(t.savedToPhotos);
+      if (inViewer) {
+        setImageNotice(t.savedToPhotos);
+        setImageNoticeOk(true);
+      }
+    } catch (caught) {
+      if (isCancel(caught)) {
+        return;
+      }
+      fail(t.imageFailed);
+    } finally {
+      setSavingPage(null);
+    }
+  }
+
   async function sharePdf() {
     await waitUntilFitted();
     const uris = sheetsRef.current.map((sheet) => pageUri(sheet));
     if (uris.length === 0) {
       setError(t.noPages);
+      return;
+    }
+    if (savingPage != null) {
       return;
     }
     setSharing(true);
@@ -612,6 +664,10 @@ export default function App() {
     setSheets([]);
     setJob(null);
     setError(null);
+    setImageNotice(null);
+    setImageNoticeOk(false);
+    setPhotoSaved(null);
+    setSavedPhotoIds([]);
     setSelectedPage(null);
     setPhase('editing');
     setTab('home');
@@ -635,6 +691,7 @@ export default function App() {
     if (removed != null) {
       preparingIds.current.delete(removed.id);
       fittedUri.current.delete(removed.id);
+      setSavedPhotoIds((current) => current.filter((id) => id !== removed.id));
     }
     const next = sheets.filter((_, item) => item !== index);
     sheetsRef.current = next;
@@ -717,7 +774,28 @@ export default function App() {
         seeAfter={t.seeAfter}
         beforeLabel={t.before}
         afterLabel={t.after}
-        onBack={() => setSelectedPage(null)}
+        downloadLabel={savingPage != null ? t.preparingImage : t.downloadImage}
+        saving={savingPage != null}
+        notice={imageNotice}
+        noticeOk={imageNoticeOk}
+        saved={sheets.map((sheet) => savedPhotoIds.includes(sheet.id))}
+        onPageChange={() => {
+          setImageNotice(null);
+          setImageNoticeOk(false);
+        }}
+        onDownload={(index) => {
+          const uri = shownPages[index];
+          const sheet = sheets[index];
+          if (uri == null || sheet?.processed == null) {
+            return;
+          }
+          void shareImage(uri, index, true);
+        }}
+        onBack={() => {
+          setImageNotice(null);
+          setImageNoticeOk(false);
+          setSelectedPage(null);
+        }}
       />
     );
   }
@@ -746,6 +824,20 @@ export default function App() {
             accessibilityLabel={t.close}
           >
             <Text style={styles.errorBannerClose}>×</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {photoSaved != null && error == null && tab === 'home' ? (
+        <View style={styles.savedBanner}>
+          <Text style={styles.savedBannerText}>{photoSaved}</Text>
+          <Pressable
+            onPress={() => setPhotoSaved(null)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={t.close}
+          >
+            <Text style={styles.savedBannerClose}>×</Text>
           </Pressable>
         </View>
       ) : null}
@@ -847,7 +939,7 @@ export default function App() {
               ) : (
                 <Pressable
                   style={styles.resultPrimary}
-                  disabled={sharing}
+                  disabled={sharing || savingPage != null}
                   onPress={() => void sharePdf()}
                 >
                   <Text style={styles.resultPrimaryLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
@@ -862,7 +954,7 @@ export default function App() {
               {pendingCount > 0 ? (
                 <Pressable
                   style={styles.resultSecondary}
-                  disabled={sharing}
+                  disabled={sharing || savingPage != null}
                   onPress={() => void sharePdf()}
                 >
                   <Text style={styles.resultSecondaryLabel}>{sharing ? t.preparingPdf : t.downloadPdf}</Text>
@@ -1040,7 +1132,10 @@ export default function App() {
                       <Pressable
                         style={styles.gridThumb}
                         delayLongPress={220}
-                        onPress={() => setSelectedPage({ uri, index })}
+                        onPress={() => {
+                          setImageNotice(null);
+                          setSelectedPage({ uri, index });
+                        }}
                         onLongPress={
                           canReorder && sheet.processed != null
                             ? (event) => {
@@ -1071,6 +1166,25 @@ export default function App() {
                       </Pressable>
                       {sheet.processed != null ? (
                         <View style={styles.gridDoneDot} />
+                      ) : null}
+                      {phase !== 'processing' &&
+                      drag == null &&
+                      sheet.processed != null &&
+                      !savedPhotoIds.includes(sheet.id) ? (
+                        <Pressable
+                          style={styles.gridDownload}
+                          disabled={sharing || savingPage != null}
+                          onPress={() => void shareImage(uri, index)}
+                          hitSlop={6}
+                          accessibilityRole="button"
+                          accessibilityLabel={t.downloadImage}
+                        >
+                          {savingPage === index ? (
+                            <ActivityIndicator color="#111111" size="small" />
+                          ) : (
+                            <Text style={styles.gridDownloadLabel}>↓</Text>
+                          )}
+                        </Pressable>
                       ) : null}
                       {phase !== 'processing' && sheet.processed == null && processedCount > 0 ? (
                         <View style={styles.gridPending}>
@@ -1317,6 +1431,13 @@ function ImageViewer({
   seeAfter,
   beforeLabel,
   afterLabel,
+  downloadLabel,
+  saving,
+  notice,
+  noticeOk,
+  saved,
+  onPageChange,
+  onDownload,
   onBack,
 }: {
   pages: string[];
@@ -1328,6 +1449,13 @@ function ImageViewer({
   seeAfter: string;
   beforeLabel: string;
   afterLabel: string;
+  downloadLabel: string;
+  saving: boolean;
+  notice: string | null;
+  noticeOk: boolean;
+  saved: boolean[];
+  onPageChange: () => void;
+  onDownload: (index: number) => void;
   onBack: () => void;
 }) {
   const { width } = useWindowDimensions();
@@ -1338,9 +1466,16 @@ function ImageViewer({
   const pagerRef = useRef(null as FlatList<string> | null);
   const thumbRef = useRef(null as FlatList<string> | null);
   const skipThumbSync = useRef(true);
+  const pageChangeRef = useRef(onPageChange);
+  pageChangeRef.current = onPageChange;
+  const pageRef = useRef(startIndex);
   const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: ViewToken[] }) => {
     const next = viewableItems[0]?.index;
     if (next != null) {
+      if (next !== pageRef.current) {
+        pageRef.current = next;
+        pageChangeRef.current();
+      }
       setCurrent(next);
     }
   }).current;
@@ -1424,6 +1559,26 @@ function ImageViewer({
         removeClippedSubviews={false}
         onScrollToIndexFailed={() => undefined}
       />
+      {currentCanCompare && (saved[current] !== true || notice != null) ? (
+        <View style={styles.viewerDownloadWrap}>
+          {notice != null ? (
+            <Text style={[styles.viewerDownloadNotice, noticeOk ? styles.viewerDownloadSaved : null]}>
+              {notice}
+            </Text>
+          ) : null}
+          {saved[current] === true ? null : (
+            <Pressable
+              style={styles.viewerDownload}
+              disabled={saving}
+              onPress={() => onDownload(current)}
+              accessibilityRole="button"
+              accessibilityLabel={downloadLabel}
+            >
+              <Text style={styles.viewerDownloadLabel}>{downloadLabel}</Text>
+            </Pressable>
+          )}
+        </View>
+      ) : null}
       <FlatList
         ref={thumbRef}
         data={pages}
@@ -2011,6 +2166,23 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: -1,
   },
+  gridDownload: {
+    position: 'absolute',
+    right: 8,
+    bottom: 8,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#FFD600',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gridDownloadLabel: {
+    color: '#111111',
+    fontSize: 16,
+    fontWeight: '800',
+    marginTop: -1,
+  },
   errorBanner: {
     marginTop: 58,
     marginHorizontal: 20,
@@ -2044,6 +2216,31 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13,
     fontVariant: ['tabular-nums'],
+  },
+  savedBanner: {
+    marginTop: 58,
+    marginHorizontal: 20,
+    backgroundColor: '#FFD600',
+    borderRadius: 18,
+    paddingLeft: 16,
+    paddingRight: 12,
+    paddingVertical: 12,
+    zIndex: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  savedBannerText: {
+    flex: 1,
+    color: '#111111',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  savedBannerClose: {
+    color: '#111111',
+    fontSize: 22,
+    fontWeight: '700',
+    lineHeight: 24,
   },
   statusRow: {
     marginTop: 18,
@@ -2714,6 +2911,33 @@ const styles = StyleSheet.create({
   },
   viewerPager: {
     flex: 1,
+  },
+  viewerDownloadWrap: {
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    gap: 8,
+  },
+  viewerDownloadNotice: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  viewerDownloadSaved: {
+    color: '#FFD600',
+    fontWeight: '800',
+  },
+  viewerDownload: {
+    backgroundColor: '#FFD600',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  viewerDownloadLabel: {
+    color: '#111111',
+    fontSize: 14,
+    fontWeight: '800',
   },
   viewerStage: {
     flex: 1,

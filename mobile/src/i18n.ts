@@ -47,6 +47,8 @@ type Copy = {
   jobId: (id: string) => string;
   preparingPdf: string;
   downloadPdf: string;
+  preparingImage: string;
+  downloadImage: string;
   shareBlank: string;
   erased: (n: number) => string;
   erasedHint: string;
@@ -75,6 +77,9 @@ type Copy = {
   noPages: string;
   saveFailed: string;
   pdfFailed: string;
+  imageFailed: string;
+  savedToPhotos: string;
+  photoDenied: string;
   shareUnavailable: string;
   appleLogin: string;
   googleLogin: string;
@@ -118,7 +123,7 @@ export const copy: Record<Locale, Copy> = {
       '需要時可開啟二值化，讓卷面更清楚。',
       '處理後可放大查看，左右滑動換頁。',
       '按「看修改前」對比原圖與清除結果。',
-      '下載 PDF 帶走；試卷只留在這次處理裡。',
+      '可把單張存進相簿，或下載整份 PDF；試卷只留在這次處理裡。',
     ],
     album: '相簿',
     maxPages: (n) => `最多 ${n} 頁`,
@@ -142,6 +147,8 @@ export const copy: Record<Locale, Copy> = {
     jobId: (id) => `工作 ${id}`,
     preparingPdf: '準備 PDF',
     downloadPdf: '下載 PDF',
+    preparingImage: '儲存中',
+    downloadImage: '存到相片',
     shareBlank: '分享空白卷',
     erased: (n) => `已清除 ${n} 頁`,
     erasedHint: '點圖可對比修改前後',
@@ -170,6 +177,9 @@ export const copy: Record<Locale, Copy> = {
     noPages: '還沒有頁面。先掃，再清。',
     saveFailed: '無法儲存檔案',
     pdfFailed: '無法下載 PDF',
+    imageFailed: '無法存到相片',
+    savedToPhotos: '已存到相片',
+    photoDenied: '請允許儲存到相片',
     shareUnavailable: '這台裝置無法分享檔案',
     appleLogin: '透過 Apple 登入',
     googleLogin: '透過 Google 登入',
@@ -211,7 +221,7 @@ export const copy: Record<Locale, Copy> = {
       '需要时可开启二值化，让卷面更清楚。',
       '处理后可放大查看，左右滑动换页。',
       '按「看修改前」对比原图与清除结果。',
-      '下载 PDF 带走；试卷只留在这次处理里。',
+      '可把单张存进相册，或下载整份 PDF；试卷只留在这次处理里。',
     ],
     album: '相册',
     maxPages: (n) => `最多 ${n} 页`,
@@ -235,6 +245,8 @@ export const copy: Record<Locale, Copy> = {
     jobId: (id) => `工作 ${id}`,
     preparingPdf: '准备 PDF',
     downloadPdf: '下载 PDF',
+    preparingImage: '保存中',
+    downloadImage: '保存到相册',
     shareBlank: '分享空白卷',
     erased: (n) => `已清除 ${n} 页`,
     erasedHint: '点图可对比修改前后',
@@ -263,6 +275,9 @@ export const copy: Record<Locale, Copy> = {
     noPages: '还没有页面。先扫，再清。',
     saveFailed: '无法保存文件',
     pdfFailed: '无法下载 PDF',
+    imageFailed: '无法保存到相册',
+    savedToPhotos: '已保存到相册',
+    photoDenied: '请允许保存到相册',
     shareUnavailable: '这台设备无法分享文件',
     appleLogin: '通过 Apple 登录',
     googleLogin: '通过 Google 登录',
@@ -304,7 +319,7 @@ export const copy: Record<Locale, Copy> = {
       'Turn on binarize to sharpen the page.',
       'Pinch to zoom, swipe to the next page.',
       'Tap Before to compare the original with the result.',
-      'Download a PDF. Pages stay only for this session.',
+      'Save one image to Photos, or download the whole PDF. Pages stay only for this session.',
     ],
     album: 'Album',
     maxPages: (n) => `Up to ${n} pages`,
@@ -328,6 +343,8 @@ export const copy: Record<Locale, Copy> = {
     jobId: (id) => `Job ${id}`,
     preparingPdf: 'Preparing PDF',
     downloadPdf: 'Download PDF',
+    preparingImage: 'Saving',
+    downloadImage: 'Save to Photos',
     shareBlank: 'Share the blank paper',
     erased: (n) => (n === 1 ? '1 page erased' : `${n} pages erased`),
     erasedHint: 'Tap a page to compare before and after',
@@ -356,6 +373,9 @@ export const copy: Record<Locale, Copy> = {
     noPages: 'No pages yet. Scan, then erase.',
     saveFailed: "Couldn't save the file",
     pdfFailed: "Couldn't download the PDF",
+    imageFailed: "Couldn't save to Photos",
+    savedToPhotos: 'Saved to Photos',
+    photoDenied: 'Allow saving to Photos',
     shareUnavailable: "This device can't share files",
     appleLogin: 'Continue with Apple',
     googleLogin: 'Continue with Google',
