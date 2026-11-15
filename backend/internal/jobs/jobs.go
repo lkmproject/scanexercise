@@ -408,6 +408,15 @@ func (s *Store) RunContext(ctx context.Context, jobID string) {
 		}
 	}
 	s.erasePages(ctx, job)
+	s.pauseAfterTextIn()
+}
+
+func (s *Store) pauseAfterTextIn() {
+	gap := s.settings.TextInJobGapSeconds
+	if gap <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(gap) * time.Second)
 }
 
 const textInConcurrency = 2

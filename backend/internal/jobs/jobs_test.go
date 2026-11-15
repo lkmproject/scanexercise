@@ -243,6 +243,24 @@ func TestGetKeepsFreshRunning(t *testing.T) {
 	}
 }
 
+func TestPauseAfterTextInHonorsGap(t *testing.T) {
+	store := NewStore(config.Settings{DataDir: t.TempDir(), TextInJobGapSeconds: 1}, stubEditor{})
+	start := time.Now()
+	store.pauseAfterTextIn()
+	if time.Since(start) < time.Second {
+		t.Fatal("wanted 1s gap")
+	}
+}
+
+func TestPauseAfterTextInZeroIsSkipped(t *testing.T) {
+	store := NewStore(config.Settings{DataDir: t.TempDir()}, stubEditor{})
+	start := time.Now()
+	store.pauseAfterTextIn()
+	if time.Since(start) >= 200*time.Millisecond {
+		t.Fatal("zero gap should not sleep")
+	}
+}
+
 func assertCode(t *testing.T, err error, code apicode.Code) {
 	t.Helper()
 	var jobErr *Error

@@ -62,7 +62,7 @@ API 金鑰只放在伺服器。客戶端不接觸模型。
 - 只縮一次給 TextIn：長邊 1920、JPEG quality 95；仍超過約 3MB 再降質，最低 70。預覽／PDF 用同一張圖，不再先存 2560 再縮。
 - TextIn 回圖若已是 JPEG 且長邊 ≤ 1920 則原樣留下；超過 1920 才縮，非 JPEG 才轉成 JPEG quality 99。
 - 單張上傳圖超過 20MB 回 `1105`。
-- 單張上傳圖對應一次模型呼叫。
+- 單張上傳圖對應一次模型呼叫。同一份工作同時最多 2 張。工作結束後再等 1 秒才結束這次執行，避免下一份立刻開打。
 
 ### JSON 回傳
 
@@ -94,7 +94,7 @@ JSON API 一律為 `{ "code": int32, "reason": string, "data": object | null }`�
 | `POST` | `/scanexercise/auth/google` | 以 Google `id_token` 登入或自動註冊，回傳帳號、剩餘次數 `remaining` 與 3 日 JWT `token`。第一次註冊送 2 次 |
 | `GET` | `/scanexercise/me` | 回傳目前帳號與剩餘清除次數 |
 | `POST` | `/scanexercise/uploads` | JSON `{ "count": n }` 回傳 `{ "files": [{ "key", "url" }] }`。先看剩餘次數，不足回 `1401` 且不發上傳網址。`url` 為 S3 預簽 PUT（15 分鐘、`Content-Type: image/jpeg`），`key` 形如 `uploads/{userId}/{batch}/{i}.jpg` |
-| `POST` | `/scanexercise/jobs` | JSON `{ "keys": [...], "crop": 0\|1, "binarization": 0\|1 }`，`keys` 必須是該使用者剛取得的 upload key；伺服器從 S3 讀圖、前處理後建立工作。仍接受 `multipart/form-data`（本機／測試）。回傳工作編號與扣次後的 `remaining`。按頁預扣，次數不足回 `1401`。TextIn 每次同時最多 2 張。某一張失敗就不再送後面的張；同一批裡已經成功的頁保留。只退沒成功的頁 |
+| `POST` | `/scanexercise/jobs` | JSON `{ "keys": [...], "crop": 0\|1, "binarization": 0\|1 }`，`keys` 必須是該使用者剛取得的 upload key；伺服器從 S3 讀圖、前處理後建立工作。仍接受 `multipart/form-data`（本機／測試）。回傳工作編號與扣次後的 `remaining`。按頁預扣，次數不足回 `1401`。TextIn 每次同時最多 2 張。某一張失敗就不再送後面的張；同一批裡已經成功的頁保留。只退沒成功的頁。整份工作結束後再等 1 秒 |
 | `GET` | `/scanexercise/jobs/{id}` | 回傳狀態：`pending`、`running`、`succeeded`、`failed`，以及目前 `remaining`。`running` 超過 TextIn 逾時加 60 秒沒有心跳、或 `pending` 超過 13 分鐘，標成 `failed`（`model timed out`）並退次，避免 worker OOM 後前端無限輪詢 |
 | `GET` | `/scanexercise/jobs/{id}/preview` | 成功的頁回傳結果圖。工作失敗時仍可讀已完成的頁 |
 

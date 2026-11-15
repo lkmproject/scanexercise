@@ -14,6 +14,7 @@ type Settings struct {
 	RetentionHours       int
 	MaxLongEdge          int
 	TextInTimeoutSeconds int
+	TextInJobGapSeconds  int
 	MaxUploadBytes       int
 	GoogleWebClientID    string
 	AWSRegion            string
@@ -30,6 +31,7 @@ func Load() Settings {
 		RetentionHours:       getenvInt("RETENTION_HOURS", 24),
 		MaxLongEdge:          getenvInt("MAX_LONG_EDGE", 2560),
 		TextInTimeoutSeconds: getenvInt("TEXTIN_TIMEOUT_SECONDS", 180),
+		TextInJobGapSeconds:  getenvInt("TEXTIN_JOB_GAP_SECONDS", 1),
 		MaxUploadBytes:       20 * 1024 * 1024,
 		GoogleWebClientID: getenv(
 			"GOOGLE_WEB_CLIENT_ID",
